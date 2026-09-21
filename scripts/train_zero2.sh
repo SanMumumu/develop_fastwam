@@ -130,9 +130,17 @@ write_launch_metadata "${RUN_DIR}"
 
 echo "[launch] nproc_per_node=${NPROC_PER_NODE} num_machines=${NUM_MACHINES} machine_rank=${MACHINE_RANK} run_id=${RUN_ID}"
 
+# `--num_processes` is the GLOBAL rank count; see the note in train_zero1.sh.
+TOTAL_PROCESSES=$((NPROC_PER_NODE * NUM_MACHINES))
+
 accelerate launch \
   --config_file scripts/accelerate_configs/accelerate_zero2_ds.yaml \
-  --num_processes "${NPROC_PER_NODE}" \
+  --num_processes "${TOTAL_PROCESSES}" \
+  --num_machines "${NUM_MACHINES}" \
+  --machine_rank "${MACHINE_RANK}" \
+  --main_process_ip "${MAIN_PROCESS_IP}" \
+  --main_process_port "${MAIN_PROCESS_PORT}" \
+  --deepspeed_multinode_launcher standard \
   scripts/train.py \
   "output_dir=${RUN_DIR}" \
   "wandb.name=${TASK_BASENAME}_${RUN_ID}" \

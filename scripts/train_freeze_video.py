@@ -1,123 +1,58 @@
-"""Training entrypoint with video expert frozen.
+"""Training entrypoint with the video expert frozen.
 
-Usage (same as train_zero1.sh but pointing to this script)::
+This is a thin wrapper around :mod:`scripts.train` that forces
+``freeze_video_expert=true``. It exists only so that the historical command
+line ``python scripts/train_freeze_video.py task=...`` keeps working.
 
-    CUDA_VISIBLE_DEVICES=4,5 accelerate launch \\
-        --config_file scripts/accelerate_configs/accelerate_zero1_ds.yaml \\
-        --num_processes 2 \\
-        scripts/train_freeze_video.py \\
-        output_dir=./runs/libero_uncond_2cam224_1e-4_300m/<run_id> \\
-        task=libero_uncond_2cam224_1e-4_300m \\
-        resume=checkpoints/libero_uncond_2cam224_300m.pt
-
-Or use the helper shell script::
+Usage::
 
     bash scripts/train_freeze_video.sh 2 task=libero_uncond_2cam224_1e-4_300m \\
         resume=checkpoints/libero_uncond_2cam224_300m.pt
+
+Equivalent, and preferred for new work::
+
+    bash scripts/train_zero1.sh 2 task=... freeze_video_expert=true
+
+Historical note -- why this file no longer monkey-patches the trainer:
+
+    It used to replace ``Wan22Trainer._configure_trainable_parameters`` and
+    ``Wan22Trainer._set_dit_only_train_mode``. Both patches were subtly broken.
+    ``_configure_trainable_parameters`` began with
+    ``if hasattr(model, "configure_trainable_parameters"): return
+    model.configure_trainable_parameters(freeze_video_expert=self.freeze_video_expert)``
+    -- and ``self.freeze_video_expert`` came from the config, defaulting to
+    ``False``. So for any model that defined that method (``DreamFastWAM``), the
+    entire patch body was dead code and nothing was frozen at optimizer-build
+    time. The *other* patch then set ``requires_grad_(False)`` on the video
+    expert only after ``accelerator.prepare``, by which point ZeRO had already
+    allocated master weights plus Adam moments for ~5 B parameters that would
+    never receive a gradient.
+
+    ``FastWAM`` now implements ``configure_trainable_parameters`` itself (as
+    ``DreamFastWAM`` already did), so the single ``freeze_video_expert`` config
+    flag is honoured by every model and the patches are unnecessary.
 """
 
-import logging
-
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 from fastwam.runtime import run_training
-from fastwam.trainer import Wan22Trainer
 from fastwam.utils.config_resolvers import register_default_resolvers
+from fastwam.utils.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
-
-# ── monkey-patch: freeze video expert during _set_dit_only_train_mode ──────
-_original_set_dit_only = Wan22Trainer._set_dit_only_train_mode
-
-
-def _freeze_video_set_dit_only(self):
-    """Same as original but additionally freezes ``mixtures.video`` in the MoT."""
-    model = self.accelerator.unwrap_model(self.model)
-    model.eval()
-    model.requires_grad_(False)
-    model.dit.train()
-    model.dit.requires_grad_(True)
-
-    if hasattr(model.dit, "mixtures"):
-        mixtures = model.dit.mixtures
-        # ── freeze video ──
-        if "video" in mixtures:
-            video_expert = mixtures["video"]
-            video_expert.eval()
-            video_expert.requires_grad_(False)
-            video_params = sum(p.numel() for p in video_expert.parameters())
-            logger.info(
-                "Video expert FROZEN (eval mode, no grad) — %.2f B params.",
-                video_params / 1e9,
-            )
-
-        # ── unfreeze action ──
-        if "action" in mixtures:
-            action_expert = mixtures["action"]
-            action_expert.train()
-            action_expert.requires_grad_(True)
-            action_params = sum(p.numel() for p in action_expert.parameters())
-            logger.info(
-                "Action expert TRAINABLE — %.2f M params.",
-                action_params / 1e6,
-            )
-
-    # ── proprio encoder (unchanged from original) ──
-    proprio_encoder = getattr(model, "proprio_encoder", None)
-    if proprio_encoder is not None:
-        proprio_encoder.train()
-        proprio_encoder.requires_grad_(True)
-
-
-Wan22Trainer._set_dit_only_train_mode = _freeze_video_set_dit_only
-
-
-# ── monkey-patch: exclude video expert from optimizer params ──────────────────
-_original_configure_trainable = Wan22Trainer._configure_trainable_parameters
-
-
-def _freeze_video_configure_trainable(self, model):
-    """Same as original but excludes ``mixtures.video`` from returned params."""
-    if hasattr(model, "configure_trainable_parameters"):
-        return model.configure_trainable_parameters(freeze_video_expert=self.freeze_video_expert)
-
-    model.eval()
-    model.requires_grad_(False)
-    model.dit.train()
-    model.dit.requires_grad_(True)
-
-    # Freeze video expert before collecting params for optimizer
-    if hasattr(model.dit, "mixtures") and "video" in model.dit.mixtures:
-        video_expert = model.dit.mixtures["video"]
-        video_expert.eval()
-        video_expert.requires_grad_(False)
-        video_params = sum(p.numel() for p in video_expert.parameters())
-        logger.info(
-            "Video expert FROZEN (no optimizer states) — %.2f B params.",
-            video_params / 1e9,
-        )
-
-    proprio_encoder = getattr(model, "proprio_encoder", None)
-    if proprio_encoder is not None:
-        proprio_encoder.train()
-        proprio_encoder.requires_grad_(True)
-
-    params = [p for p in model.parameters() if p.requires_grad]
-    logger.info(
-        "Trainable parameters (video-excluded): %.3fM",
-        sum(p.numel() for p in params) / 1e6,
-    )
-    return params
-
-
-Wan22Trainer._configure_trainable_parameters = _freeze_video_configure_trainable
+logger = get_logger(__name__)
 
 register_default_resolvers()
 
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig):
+    # Force the freeze on, but tell the user if their override said otherwise so
+    # a contradictory command line does not silently do the opposite.
+    if cfg.get("freeze_video_expert", False) is False:
+        with open_dict(cfg):
+            cfg.freeze_video_expert = True
+        logger.info("train_freeze_video.py: forcing freeze_video_expert=true.")
     run_training(cfg)
 
 

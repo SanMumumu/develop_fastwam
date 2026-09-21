@@ -448,6 +448,7 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
+    noise_seed: Optional[int] = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
@@ -480,7 +481,7 @@ def _predict_action_chunk(
             if cfg.EVALUATION.get("sigma_shift") is None
             else float(cfg.EVALUATION.get("sigma_shift"))
         ),
-        "seed": None if cfg.get("seed") is None else int(cfg.seed),
+        "seed": noise_seed,
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
@@ -560,6 +561,13 @@ def run_single_episode(
 
     t = 0
     done = False
+    # Action-noise seed. Passing a single fixed `cfg.seed` to every replan of
+    # every episode made all 50 trials of a task draw the *same* initial action
+    # noise, so they were not independent samples of the policy and a bad mode
+    # was re-entered deterministically. Derive a distinct-but-reproducible seed
+    # per (episode, replan) instead; `cfg.seed=None` still means "unseeded".
+    base_seed = None if cfg.get("seed") is None else int(cfg.seed)
+    replan_counter = 0
     pbar = tqdm(total=max_steps + num_steps_wait, desc=f"Episode {episode_idx + 1}")
     while t < max_steps + num_steps_wait:
         pbar.update(1)
@@ -569,6 +577,12 @@ def run_single_episode(
             continue
 
         if len(pending_actions) == 0:
+            noise_seed = (
+                None
+                if base_seed is None
+                else base_seed + episode_idx * 10_000 + replan_counter
+            )
+            replan_counter += 1
             action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
                 obs=obs,
                 task_description=task_description,
@@ -579,6 +593,7 @@ def run_single_episode(
                 input_w=input_w,
                 input_h=input_h,
                 model_device=model_device,
+                noise_seed=noise_seed,
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1
@@ -593,6 +608,8 @@ def run_single_episode(
             if use_action_ensembler:
                 ensembler.add_actions(action_chunk, t)
                 pending_actions = [ensembler.get_action(ts).tolist() for ts in range(t, t + replan_steps)]
+                # Bound the cache: without this it grows for the whole episode.
+                ensembler.cleanup(t)
             else:
                 pending_actions = action_chunk[:replan_steps].tolist()
             replay_images.append(imgs.copy())

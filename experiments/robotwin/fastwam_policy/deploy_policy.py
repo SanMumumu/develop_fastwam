@@ -263,6 +263,7 @@ class WorldActionRobotWinPolicy:
 
         self.pending_actions: deque[np.ndarray] = deque()
         self.episode_count = 0
+        self._replan_counter = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
@@ -330,7 +331,11 @@ class WorldActionRobotWinPolicy:
             "text_cfg_scale": self.text_cfg_scale,
             "num_inference_steps": self.num_inference_steps,
             "sigma_shift": self.sigma_shift,
-            "seed": self.seed,
+            # Per-(episode, replan) action-noise seed, matching
+            # experiments/libero/eval_libero_single.py. A single fixed seed
+            # reused across every replan and episode makes the trials of a task
+            # non-independent samples of the policy; `seed=None` stays unseeded.
+            "seed": self._next_noise_seed(),
             "rand_device": self.rand_device,
             "tiled": self.tiled,
         }
@@ -386,10 +391,19 @@ class WorldActionRobotWinPolicy:
             "sim_s": float(self._timing_rollout["sim_s"]),
         }
 
+    def _next_noise_seed(self) -> Optional[int]:
+        """Return a distinct, reproducible action-noise seed for this replan."""
+        if self.seed is None:
+            return None
+        seed = int(self.seed) + self.episode_count * 10_000 + self._replan_counter
+        self._replan_counter += 1
+        return seed
+
     def reset(self) -> None:
         self.pending_actions.clear()
         self.episode_count += 1
         self.step_count = 0
+        self._replan_counter = 0
         self.reset_timing_rollout()
 
 
