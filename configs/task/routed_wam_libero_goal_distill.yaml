@@ -1,0 +1,45 @@
+# @package _global_
+#
+# Stage 2: interface distillation on LIBERO-goal.
+# Resume from a stage-1 routed checkpoint and train the one-step student Dream
+# pass to reproduce the per-layer Dream K/V of an 8-step EMA teacher. Inference
+# then runs `dream_scheduler.inference_steps: 1`.
+
+defaults:
+  - override /data: libero_goal_2cam
+  - override /model: routed_wam
+  - _self_
+
+output_dir: ./runs/routed_wam_libero_goal_distill/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+batch_size: 16
+num_workers: 4
+lr_scheduler_type: "cosine"
+learning_rate: 1e-5
+num_epochs: 2
+max_steps: null
+log_every: 10
+save_every: 2000
+eval_every: 0
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+# Point this at the stage-1 checkpoint before submitting.
+resume: null
+freeze_video_expert: true
+
+model:
+  mot_checkpoint_mixed_attn: true
+  dream_scheduler:
+    inference_steps: 1
+  interface_distill:
+    enabled: true
+    teacher_steps: 8
+    student_steps: 1
+    ema_decay: 0.995
+    lambda_total: 1.0
+    route_aware: true
+    warmup_ratio: 0.1
+  loss:
+    lambda_video: 0.0
+    lambda_action: 1.0
+    lambda_dream: 0.1
