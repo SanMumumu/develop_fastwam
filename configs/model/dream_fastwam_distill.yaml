@@ -1,0 +1,168 @@
+# Dream Imagination Distillation (DID).
+#
+# Identical to configs/model/dream_fastwam.yaml apart from the `_target_` and the
+# `dream_distill` block at the bottom, so every other axis of the ablation is
+# held fixed by construction.
+#
+# `_target_` points into the experiment package rather than fastwam.runtime, so
+# src/fastwam/runtime.py needs no edit and the whole experiment is removable
+# with `rm -r`.
+_target_: fastwam.models.wan22.dream_distill.runtime.create_dream_distill_fastwam
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 128
+load_text_encoder: false
+proprio_dim: ${data.train.processor.proprio_output_dim}
+redirect_common_files: true
+mot_checkpoint_mixed_attn: true
+action_dit_pretrained_path: null
+skip_dit_load_from_pretrain: true
+
+video_dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 48
+  hidden_dim: 3072
+  ffn_dim: 14336
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 48
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  video_attention_mask_mode: "first_frame_causal"
+  action_conditioned: false
+  action_dim: ${data.train.processor.action_output_dim}
+  action_group_causal_mask_mode: "group_diagonal"
+
+action_dit_config:
+  action_dim: ${data.train.processor.action_output_dim}
+  hidden_dim: 130
+  ffn_dim: 520
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+dream_query_config:
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-6
+  num_heads: 24
+  attn_head_dim: 128
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  share_blocks: false
+
+  dream_query:
+    modalities: ${data.train.dream_target.modalities}
+    future_offsets: ${data.train.dream_target.future_offsets}
+    # Per horizon and modality: tokens [0:9] belong to the primary camera and
+    # tokens [9:18] belong to the wrist camera. They can interact in Dream DiT,
+    # but each camera decoder can only read its own nine tokens.
+    camera_token_split: [9, 9]
+    n_dyn: 18
+    n_depth: 18
+    n_dino: 18
+    n_sam: 18
+
+  dream_expert:
+    target_num_params_m: 200
+
+    hidden_dim: 384
+    ffn_dim: 1536
+    num_layers: 30
+    num_heads: 24
+    attn_head_dim: 128
+    mlp_ratio: 4.0
+    share_blocks: false
+
+  dream_decoder:
+    decoder_dim: 384
+    decoder_ffn_dim: 1536
+    num_layers: 2
+    num_heads: 24
+    attn_head_dim: 128
+    mlp_ratio: 4.0
+    image_patch_size: 16
+    depth:
+      enabled: true
+      target_layout: token_feature
+      source_layout: image
+      patch_size: 8
+      target_shape: [512, 64]
+    dino:
+      enabled: true
+      target_layout: grid_feature
+      target_shape: [16, 32, 768]
+    sam:
+      enabled: true
+      target_layout: grid_feature
+      target_shape: [16, 32, 256]
+    dyn:
+      enabled: true
+      type: dynamic_mask
+      target_layout: token_feature
+      source_layout: image
+      patch_size: 2
+      target_shape: [392, 1]
+
+video_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_noise:
+  use_correlated_noise_train: false
+  use_correlated_noise_infer: false
+  correlation_beta: 0.5
+  jitter: 1.0e-5
+  dataset_stats_path: null
+  action_key: default
+
+loss:
+  lambda_action: 1.0
+  lambda_video: 1.0
+  lambda_dream: 0.1
+  lambda_dyn: 1.0
+  lambda_depth: 10.0
+  lambda_dino: 1.0
+  lambda_sam: 1.0
+
+# --- Dream Imagination Distillation -----------------------------------------
+# Train-time only: at inference Dream still reads just the current frame, the
+# Video+Dream prefill still applies, and test-time cost is unchanged.
+#
+# COST: requires lambda_video > 0, because with lambda_video == 0 the video
+# branch is fed a single latent frame and no future-frame tokens exist to
+# distil from. Combined with freeze_video_expert=true this gives a frozen
+# teacher (the video loss then has no trainable parameters upstream, so it
+# contributes no gradient and is only a diagnostic), at the price of running the
+# video branch over 9 latent frames instead of 1.
+dream_distill:
+  enabled: true
+  lambda_did: 1.0
+  # "future"  -> teacher is the video expert's future-frame tokens (treatment)
+  # "current" -> teacher is the current frame (R3 control: isolates whether the
+  #              gain comes from FUTURE information or merely from one more
+  #              supervision signal)
+  teacher: future
+  # Which MoT layers to distil at. Snapshot L is the state *entering* layer L.
+  layers: [29]
+  # "current" -> Dream reads only the current video frame (the shipped mask)
+  # "all"     -> R4 oracle: Dream attends to the noisy future video tokens at
+  #              train AND test time. Breaks the prefill; measures the ceiling.
+  dream_video_access: current
