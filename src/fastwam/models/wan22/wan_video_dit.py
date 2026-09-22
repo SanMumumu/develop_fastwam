@@ -12,6 +12,19 @@ logger = get_logger(__name__)
 
     
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, ctx_mask: Optional[torch.Tensor] = None, compatibility_mode=True):
+    """Scaled dot-product attention. NOTE: the name is historical.
+
+    This does not call FlashAttention. It calls
+    ``F.scaled_dot_product_attention``, and when ``ctx_mask`` is not None
+    PyTorch explicitly *refuses* the flash backend ("Flash Attention does not
+    support non-null attn_mask") and falls back to the memory-efficient kernel.
+    Measured on this project's LIBERO shapes (B=4, S=914, 24 heads x 128), the
+    masked call costs ~0.64 ms versus ~0.26 ms unmasked -- a 2.4x tax paid
+    purely for passing a dense boolean mask.
+
+    The MoT masks are block-structured, so an equivalent formulation that slices
+    the sequence into per-block unmasked calls would regain the flash kernel.
+    """
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
@@ -476,6 +489,37 @@ class WanVideoDiT(torch.nn.Module):
         video_tokens_per_frame: int,
         device: torch.device,
     ) -> torch.Tensor:
+        """Build the video-to-video self-attention mask (``True`` = may attend).
+
+        Modes:
+
+        ``bidirectional``
+            Every token sees every token.
+
+        ``per_frame_causal``
+            Frame-level lower triangle: frame ``i`` sees frames ``0..i``.
+
+        ``first_frame_causal``
+            **Read the name carefully -- only the first frame is causal.** The
+            mask starts fully connected and then removes exactly one block:
+            first-frame queries lose access to every later-frame key. Frames
+            ``1..N`` remain *fully bidirectional* among themselves and can also
+            read frame 0::
+
+                query \\ key   | frame 0 | frames 1..N
+                --------------+---------+------------
+                frame 0       |   yes   |     no
+                frames 1..N   |   yes   |    yes
+
+            The consequence this codebase depends on: **frame-0 token
+            representations do not depend on how many frames follow them.**
+            Running the video expert on a single frame therefore reproduces the
+            frame-0 tokens of a full multi-frame forward exactly, which is what
+            makes ``MoT.prefill_video_cache`` + ``FastWAM.infer_action`` an exact
+            computation rather than an approximation. The other half of that
+            guarantee is the per-token timestep pinning in ``pre_dit`` below,
+            which always assigns ``t=0`` to frame 0.
+        """
         if video_seq_len <= 0:
             raise ValueError(f"`video_seq_len` must be positive, got {video_seq_len}")
         if video_tokens_per_frame <= 0:
@@ -543,6 +587,13 @@ class WanVideoDiT(torch.nn.Module):
                 dtype=timestep.dtype,
                 device=timestep.device,
             ) * timestep.view(batch_size, 1, 1)
+            # Frame 0 is the observed current frame: it is substituted with clean
+            # latents by the caller, so it is pinned to t=0 regardless of the
+            # sampled diffusion timestep for the rest of the clip. Together with
+            # the `first_frame_causal` mask (see build_video_to_video_mask), this
+            # makes frame-0 tokens invariant to both the noise level and the clip
+            # length -- the precondition for the single-frame prefill path in
+            # FastWAM.infer_action being exact rather than approximate.
             token_timesteps[:, 0, :] = 0
             token_timesteps = token_timesteps.reshape(batch_size, -1)
             token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1))

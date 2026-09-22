@@ -135,9 +135,13 @@ Input: image → VAE encode → latent z
 
 Key design decisions:
 - **Separate noise schedulers** for video and action (different `train_shift`/`infer_shift` parameters).
-- **Attention mask**: Video uses `first_frame_causal` (first frame attends to all, later frames are causal). Action attends to itself fully and to the first video frame only.
+- **Attention mask**: Video uses `first_frame_causal`, where **only the first frame is causal**: the mask starts fully connected and then removes one block, so first-frame queries cannot see any later frame, while frames 1..N stay fully bidirectional among themselves and can read frame 0. Action attends to itself fully and to the first video frame only; video never attends to action.
+  - Consequence: frame-0 token representations are independent of the clip length, and `pre_dit` additionally pins frame 0 to `t=0`. Together these make the single-frame prefill in `infer_action` **exactly** equal to the frame-0 slice of a full multi-frame forward, not an approximation.
+  - Consequence: the action expert structurally cannot read the generated future frames. The video loss influences actions through the shared weights, not through activations.
 - **Proprioception**: Robot state is projected through a linear layer and appended to the text context tokens.
 - **Training loss**: Weighted sum of `lambda_video * video_MSE + lambda_action * action_MSE`, each weighted by the scheduler's per-timestep weight.
+- **Gradient clipping**: under DeepSpeed, `accelerator.clip_grad_norm_` is a no-op; clipping happens inside `engine.step()` driven by `gradient_clipping` in `scripts/ds_configs/*.json`, which resolves from `max_grad_norm` via the `ACCELERATE_GRADIENT_CLIPPING` env var set in `Wan22Trainer.__init__`.
+- **Validation split**: `configs/data/libero_2cam.yaml` has no `val:` section, so `build_datasets` falls back to the *train* dataset and everything logged under `eval/` is a training metric. `configs/data/robotwin.yaml` does define a real split.
 
 Model implementations are separated by family under `src/fastwam/models/wan22/`:
 - `fastwam/` — Original FastWAM, including `joint.py` and `idm.py` variants

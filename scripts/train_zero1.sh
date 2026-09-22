@@ -130,9 +130,21 @@ write_launch_metadata "${RUN_DIR}"
 
 echo "[launch] nproc_per_node=${NPROC_PER_NODE} num_machines=${NUM_MACHINES} machine_rank=${MACHINE_RANK} run_id=${RUN_ID}"
 
+# `accelerate launch --num_processes` is the GLOBAL rank count across all nodes,
+# not the per-node count. Passing only the per-node value (and omitting
+# --num_machines/--machine_rank/--main_process_ip/--main_process_port entirely)
+# made every node start an independent single-node job that never rendezvoused,
+# because accelerate_zero1_ds.yaml pins num_machines: 1 / machine_rank: 0.
+TOTAL_PROCESSES=$((NPROC_PER_NODE * NUM_MACHINES))
+
 accelerate launch \
   --config_file scripts/accelerate_configs/accelerate_zero1_ds.yaml \
-  --num_processes "${NPROC_PER_NODE}" \
+  --num_processes "${TOTAL_PROCESSES}" \
+  --num_machines "${NUM_MACHINES}" \
+  --machine_rank "${MACHINE_RANK}" \
+  --main_process_ip "${MAIN_PROCESS_IP}" \
+  --main_process_port "${MAIN_PROCESS_PORT}" \
+  --deepspeed_multinode_launcher standard \
   scripts/train.py \
   "output_dir=${RUN_DIR}" \
   "wandb.name=${TASK_BASENAME}_${RUN_ID}" \

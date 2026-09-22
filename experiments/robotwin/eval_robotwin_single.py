@@ -32,6 +32,7 @@ Examples:
 import os
 import subprocess
 import sys
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -86,20 +87,28 @@ def _resolve_dataset_stats_path(cfg: DictConfig, ckpt_path: Path) -> Path:
 
 
 def _resolve_ckpt_tag(ckpt_path: Path) -> str:
+    """Derive a human-readable tag for the evaluated checkpoint.
+
+    Checkpoints produced by this repo live at
+    ``.../runs/<task>/<date_dir>/checkpoints/weights/step_*.pt`` and the
+    ``<task>_<date_dir>`` tag is the useful label. Checkpoints on the cluster
+    bucket may have any layout, so an unexpected shape degrades to the file stem
+    rather than aborting the evaluation -- this used to raise and made bucket
+    paths unusable.
+    """
     parts = ckpt_path.resolve().parts
     if "runs" in parts:
         runs_idx = parts.index("runs")
-        if runs_idx + 2 >= len(parts):
-            raise ValueError(
-                f"`ckpt` under runs must follow .../runs/<task>/<date_dir>/..., got: {ckpt_path}"
-            )
-        task_name = parts[runs_idx + 1]
-        date_dir = parts[runs_idx + 2]
-        if task_name == "" or date_dir == "":
-            raise ValueError(
-                f"`ckpt` under runs must follow .../runs/<task>/<date_dir>/..., got: {ckpt_path}"
-            )
-        return f"{task_name}_{date_dir}"
+        if runs_idx + 2 < len(parts):
+            task_name = parts[runs_idx + 1]
+            date_dir = parts[runs_idx + 2]
+            if task_name and date_dir:
+                return f"{task_name}_{date_dir}"
+        logging.warning(
+            "`ckpt` contains a 'runs' component but not the expected "
+            ".../runs/<task>/<date_dir>/... layout (%s); falling back to the file stem.",
+            ckpt_path,
+        )
     return ckpt_path.stem
 
 

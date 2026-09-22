@@ -1,0 +1,63 @@
+defaults:
+  - dream_fastwam
+  - _self_
+
+_target_: fastwam.routed_runtime.create_routed_wam
+
+# ---------------------------------------------------------------- generative
+# The Dream expert denoises its multi-modal targets instead of regressing them.
+# With `enabled: false` the model is behaviourally identical to dream_fastwam.
+generative_dream:
+  enabled: true
+  freq_dim: 256
+
+# Flow-matching schedule for the Dream branch. `inference_steps: 1` is the
+# deployed setting; interface distillation is what makes one step sufficient.
+dream_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+  inference_steps: 1
+
+# ------------------------------------------------------------------- router
+# Which imagined tokens the action expert is allowed to read.
+#   none      -- dense, every dream token is read (upper bound / control)
+#   threshold -- parameter-free attention-mass policy (training-free baseline)
+#   learned   -- low-rank bilinear gate, trained with a budget penalty
+router:
+  mode: learned
+  rank: 64
+  temperature: 1.0
+  # sigmoid(4) ~ 0.982, so routing starts as a near-identity and has to learn
+  # what to switch off rather than what to switch on.
+  bias_init: 4.0
+  group_granularity: modality_horizon
+  alpha: 1.0
+  min_keep_tokens: 0
+  target_keep_ratio: 0.25
+  lambda_budget: 0.01
+  gate_threshold: 1.0e-3
+  hard_prune_at_inference: true
+  warmup_ratio: 0.1
+  log_statistics: true
+  debug_force_gate: null
+  layers: null
+
+# -------------------------------------------------------- interface distill
+# Compress the multi-step Dream rollout into one forward, supervising the
+# per-layer Dream K/V that the action expert actually reads.
+# Requires generative_dream.enabled=true and freeze_video_expert=true.
+interface_distill:
+  enabled: false
+  teacher_steps: 8
+  student_steps: 1
+  ema_decay: 0.995
+  layers: null
+  lambda_k: 1.0
+  lambda_v: 1.0
+  lambda_total: 1.0
+  route_aware: true
+  warmup_ratio: 0.1
+  detach_teacher: true
+
+finetune_action_only: false

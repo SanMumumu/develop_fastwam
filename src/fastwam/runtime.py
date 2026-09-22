@@ -448,6 +448,19 @@ def create_fastwam_idm(
 def build_datasets(data_cfg: DictConfig):
     train_ds = instantiate(data_cfg.train)
     if data_cfg.get("val") is None:
+        # No held-out split configured (e.g. configs/data/libero_2cam.yaml has a
+        # `train:` section only, unlike configs/data/robotwin.yaml). The trainer
+        # still runs its periodic evaluation, but it samples from the *training*
+        # set -- so `eval/val_loss` and the `eval/psnr_*` curves are training
+        # metrics wearing validation names. Say so loudly rather than let those
+        # curves be read as generalization.
+        logger.warning(
+            "No `data.val` section configured: falling back to the TRAIN dataset for "
+            "evaluation. Everything logged under `eval/` (val_loss, psnr_*, ssim_*) is "
+            "therefore measured on training data and must NOT be read as held-out "
+            "performance. Add a `val:` section (see configs/data/robotwin.yaml) for a "
+            "real split."
+        )
         val_ds = train_ds
     else:
         train_stats_path = data_cfg.train.get("pretrained_norm_stats")

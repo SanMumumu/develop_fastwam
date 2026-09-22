@@ -66,7 +66,10 @@ class FastWAMJoint(FastWAM):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
-        test_action_with_infer_action: bool = True,
+        # Matches the base class default. It used to be True, so the warning
+        # below fired on every single call rather than only when a caller had
+        # actually asked for the (unsupported here) self-check.
+        test_action_with_infer_action: bool = False,
     ) -> dict[str, Any]:
         if test_action_with_infer_action:
             logger.warning(

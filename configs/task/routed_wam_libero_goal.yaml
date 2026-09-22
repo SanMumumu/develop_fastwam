@@ -1,0 +1,38 @@
+# @package _global_
+#
+# Stage 1: train the generative, routed imagination on LIBERO-goal.
+# The Dream branch denoises depth/DINO/SAM/dyn futures and the action expert
+# learns which of them to read. Interface distillation is added in stage 2
+# (routed_wam_libero_goal_distill).
+
+defaults:
+  - override /data: libero_goal_2cam
+  - override /model: routed_wam
+  - _self_
+
+output_dir: ./runs/routed_wam_libero_goal/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+batch_size: 32
+num_workers: 4
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 4
+max_steps: null
+log_every: 10
+save_every: 2000
+eval_every: 0
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+# The split Video-once prefill is only exact while the Video expert's K/V do not
+# depend on the diffusion step, which requires it to stay frozen.
+freeze_video_expert: true
+
+model:
+  mot_checkpoint_mixed_attn: true
+  loss:
+    # The split path never denoises future video frames, so lambda_video must be
+    # zero; the video branch contributes the current-frame world representation.
+    lambda_video: 0.0
+    lambda_action: 1.0
+    lambda_dream: 0.1

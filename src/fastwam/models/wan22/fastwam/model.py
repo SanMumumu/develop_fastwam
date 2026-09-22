@@ -442,6 +442,36 @@ class FastWAM(torch.nn.Module):
         video_tokens_per_frame: int,
         device: torch.device,
     ) -> torch.Tensor:
+        """Build the joint ``[video | action]`` self-attention mask.
+
+        Boolean, ``True`` means "this query may attend to this key". Layout::
+
+            query \\ key   | video frame 0 | video frames 1..N | action
+            --------------+---------------+-------------------+--------
+            video frame 0 |      yes      |        no         |   no
+            video 1..N    |      yes      |       yes         |   no
+            action        |      yes      |        no         |  yes
+
+        Three properties follow from this shape, and the inference path depends
+        on all three:
+
+        1. Video never attends to action, so the whole video branch is
+           independent of the action branch. That is what makes
+           :meth:`MoT.prefill_video_cache` mathematically exact rather than an
+           approximation.
+        2. Frame-0 video tokens attend only to themselves (see
+           ``build_video_to_video_mask`` with ``first_frame_causal``). Their
+           representation is therefore *independent of how many frames follow*.
+           Combined with the per-token timestep pinning in
+           ``WanModel.pre_dit`` (frame 0 always gets ``t=0``), running the video
+           expert on a single frame at inference reproduces the training-time
+           frame-0 tokens bit for bit. ``infer_action`` relies on this, and
+           ``infer_joint``'s ``test_action_with_infer_action`` check guards it.
+        3. Action attends to frame 0 only -- never to the generated future
+           frames. The video branch's future-frame activations have no reader;
+           the video loss shapes the shared weights, not the tensors the action
+           expert consumes.
+        """
         total_seq_len = video_seq_len + action_seq_len
         mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
 
@@ -652,7 +682,14 @@ class FastWAM(torch.nn.Module):
         gt_action: Optional[torch.Tensor] = None,
         return_action_attention: bool = False,
         attention_layers: Optional[list[int]] = None,
+        return_video: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # `return_video` exists so that `infer_joint` can request the video
+        # prediction explicitly. Subclasses (DreamFastWAM) default it to False to
+        # skip a `post_dit` they do not need on their action-only path; without
+        # an explicit request they would hand `infer_joint` a `None` that the
+        # scheduler then tries to multiply by a step delta.
+        del return_video  # FastWAM always computes the video prediction.
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
             timestep=timestep_video,
@@ -824,9 +861,15 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
-        test_action_with_infer_action: bool = True,
+        # Debug assertion: re-runs the *entire* `infer_action` denoising loop and
+        # compares it against the joint loop, roughly doubling inference cost.
+        # It guards the KV-cache equivalence documented on
+        # `_build_mot_attention_mask`. Off by default; turn it on deliberately
+        # after changing the mask, the prefill path, or the timestep pinning.
+        test_action_with_infer_action: bool = False,
     ) -> dict[str, Any]:
         self.eval()
+        self._reject_unsupported_guidance(negative_prompt, text_cfg_scale)
         if test_action_with_infer_action:
             if seed is None:
                 raise ValueError("`test_action_with_infer_action=True` requires non-null `seed`.")
@@ -974,9 +1017,16 @@ class FastWAM(torch.nn.Module):
                 context_mask=context_mask,
                 fuse_vae_embedding_in_latents=fuse_flag,
                 gt_action=action,
+                # Required: subclasses skip the video head unless asked.
+                return_video=True,
             )
             pred_video = pred_video_posi
             pred_action = pred_action_posi
+            if pred_video is None:
+                raise RuntimeError(
+                    f"{type(self).__name__}._predict_joint_noise returned no video prediction "
+                    "despite return_video=True; infer_joint cannot advance the video latents."
+                )
 
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
@@ -1013,6 +1063,7 @@ class FastWAM(torch.nn.Module):
         tiled: bool = False,
     ) -> dict[str, Any]:
         self.eval()
+        self._reject_unsupported_guidance(negative_prompt, text_cfg_scale)
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError(
                 "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
@@ -1161,7 +1212,10 @@ class FastWAM(torch.nn.Module):
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
         negative_prompt: Optional[str] = None,
-        text_cfg_scale: float = 5.0,
+        # Neutral defaults: FastWAM implements no classifier-free guidance, so
+        # any non-neutral value here is rejected rather than silently dropped.
+        # This used to default to 5.0, which looked like CFG was on.
+        text_cfg_scale: float = 1.0,
         action_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
         sigma_shift: Optional[float] = None,
@@ -1169,6 +1223,9 @@ class FastWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
     ):
+        # `action_cfg_scale` is accepted for signature compatibility but is not
+        # forwarded anywhere, so validate it here where it would otherwise vanish.
+        self._reject_unsupported_guidance(negative_prompt, text_cfg_scale, action_cfg_scale)
         return self.infer_joint(
             prompt=prompt,
             input_image=input_image,
@@ -1187,6 +1244,37 @@ class FastWAM(torch.nn.Module):
             tiled=tiled,
         )
 
+    @staticmethod
+    def _reject_unsupported_guidance(
+        negative_prompt: Optional[str],
+        text_cfg_scale: float,
+        action_cfg_scale: float = 1.0,
+    ) -> None:
+        """Refuse guidance settings that this model would silently ignore.
+
+        Classifier-free guidance is implemented only in the legacy
+        ``Wan22Core.infer`` path. FastWAM's ``infer_joint`` / ``infer_action``
+        accept these parameters for signature compatibility but never read them,
+        so a sweep over ``EVALUATION.text_cfg_scale`` used to produce identical
+        numbers at every value. Failing loudly is cheaper than the A/B time.
+        """
+        offenders = []
+        # Shipped eval configs use `negative_prompt: ""` to mean "none", and
+        # runtime.run_inference stringifies it, so only a non-blank string counts
+        # as an actual request for negative guidance.
+        if negative_prompt is not None and str(negative_prompt).strip() not in {"", "None"}:
+            offenders.append(f"negative_prompt={negative_prompt!r}")
+        if float(text_cfg_scale) != 1.0:
+            offenders.append(f"text_cfg_scale={text_cfg_scale}")
+        if float(action_cfg_scale) != 1.0:
+            offenders.append(f"action_cfg_scale={action_cfg_scale}")
+        if offenders:
+            raise ValueError(
+                "Classifier-free guidance is not implemented in FastWAM inference; "
+                f"the following would be silently ignored: {', '.join(offenders)}. "
+                "Leave the cfg scales at 1.0 and negative_prompt at None."
+            )
+
     def save_checkpoint(self, path, optimizer=None, step=None):
         payload = {
             "mot": self.mot.state_dict(),
@@ -1199,13 +1287,101 @@ class FastWAM(torch.nn.Module):
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
-    def load_checkpoint(self, path, optimizer=None):
+    def freeze_video_expert(self):
+        """Put the video expert in eval mode and detach it from autograd."""
+        self.video_expert.eval()
+        self.video_expert.requires_grad_(False)
+        logger.info(
+            "Frozen FastWAM video expert (%.2f B params, no optimizer state).",
+            sum(p.numel() for p in self.video_expert.parameters()) / 1e9,
+        )
+
+    def configure_trainable_parameters(self, freeze_video_expert: bool = False) -> list[torch.nn.Parameter]:
+        """Select the parameters the optimizer should own.
+
+        The trainer calls this *before* ``accelerator.prepare``, so whatever is
+        returned here is exactly what ZeRO builds optimizer state for. Anything
+        frozen after this point would still get master weights plus Adam moments
+        allocated for it -- which is why the freeze decision has to happen here
+        and not in a later ``requires_grad_`` pass.
+
+        Previously ``FastWAM`` had no such method, so the trainer fell through to
+        a generic branch that unconditionally unfroze ``model.dit`` and silently
+        ignored ``freeze_video_expert``.
+        """
+        self.eval()
+        self.requires_grad_(False)
+        self.mot.train()
+        self.action_expert.train()
+        self.action_expert.requires_grad_(True)
+        if freeze_video_expert:
+            self.freeze_video_expert()
+        else:
+            self.video_expert.train()
+            self.video_expert.requires_grad_(True)
+        if self.proprio_encoder is not None:
+            self.proprio_encoder.train()
+            self.proprio_encoder.requires_grad_(True)
+        params = [p for p in self.parameters() if p.requires_grad]
+        logger.info(
+            "FastWAM trainable parameters: %.3fM (freeze_video_expert=%s)",
+            sum(p.numel() for p in params) / 1e6,
+            freeze_video_expert,
+        )
+        return params
+
+    def load_checkpoint(self, path, optimizer=None, *, strict_shapes: bool = False):
+        """Load a FastWAM checkpoint, reporting anything that did not load.
+
+        ``load_state_dict(..., strict=False)`` returns the missing/unexpected key
+        lists; discarding them lets a structurally incompatible checkpoint load
+        "successfully" while leaving weights at their initial values. That is
+        particularly dangerous here because the evaluation configs set
+        ``skip_dit_load_from_pretrain: true``, so an unloaded video expert stays
+        randomly initialized and evaluation silently produces garbage. Pass
+        ``strict_shapes=True`` to turn any discrepancy into an error.
+        """
         payload = torch.load(path, map_location="cpu")
         if "mot" in payload:
-            self.mot.load_state_dict(payload["mot"], strict=False)
+            current = self.mot.state_dict()
+            filtered = {}
+            skipped_shape = []
+            for key, value in payload["mot"].items():
+                if key in current and tuple(current[key].shape) != tuple(value.shape):
+                    skipped_shape.append((key, tuple(value.shape), tuple(current[key].shape)))
+                    continue
+                filtered[key] = value
+            incompatible = self.mot.load_state_dict(filtered, strict=False)
+            missing = list(incompatible.missing_keys)
+            unexpected = list(incompatible.unexpected_keys)
+            logger.info("Loaded FastWAM MoT checkpoint (strict=False) from %s", path)
+            if missing:
+                logger.warning("Checkpoint missing keys (%d): %s", len(missing), missing[:50])
+            if unexpected:
+                logger.warning("Checkpoint unexpected keys (%d): %s", len(unexpected), unexpected[:50])
+            if skipped_shape:
+                logger.warning(
+                    "Skipped checkpoint keys with incompatible shapes (%d). First keys: %s",
+                    len(skipped_shape),
+                    skipped_shape[:20],
+                )
+            if strict_shapes and (skipped_shape or missing or unexpected):
+                raise RuntimeError(
+                    "Checkpoint is not structurally compatible with the current FastWAM model. "
+                    f"skipped_shape={skipped_shape[:20]} missing={missing[:50]} unexpected={unexpected[:50]}"
+                )
         elif "dit" in payload:
+            if strict_shapes:
+                raise RuntimeError(
+                    "Cannot strictly load a legacy `dit` checkpoint into FastWAM. "
+                    "Use a checkpoint saved with the full `mot` state."
+                )
             logger.warning("Loading legacy `dit` checkpoint into video expert only.")
-            self.video_expert.load_state_dict(payload["dit"], strict=False)
+            incompatible = self.video_expert.load_state_dict(payload["dit"], strict=False)
+            if incompatible.missing_keys:
+                logger.warning("Video expert missing keys: %s", incompatible.missing_keys[:50])
+            if incompatible.unexpected_keys:
+                logger.warning("Video expert unexpected keys: %s", incompatible.unexpected_keys[:50])
         else:
             raise ValueError(f"Checkpoint missing both `mot` and `dit` keys: {path}")
         if self.proprio_encoder is not None:

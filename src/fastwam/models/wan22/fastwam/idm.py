@@ -283,7 +283,8 @@ class FastWAMIDM(FastWAMJoint):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
-        test_action_with_infer_action: bool = True,
+        # Matches the base class default; the IDM path discards it either way.
+        test_action_with_infer_action: bool = False,
     ) -> dict[str, Any]:
         del negative_prompt, text_cfg_scale, test_action_with_infer_action
         self.eval()

@@ -30,20 +30,24 @@ def _resolve_path(path_str: str, *, base: Path) -> Path:
 
 
 def _resolve_ckpt_tag(ckpt_path: Path) -> str:
+    """Derive a label for the evaluated checkpoint.
+
+    Kept in sync with eval_robotwin_single._resolve_ckpt_tag: an unexpected path
+    layout (e.g. a checkpoint read straight off the cluster bucket rather than
+    from ./runs) degrades to the file stem instead of aborting the sweep.
+    """
     parts = ckpt_path.resolve().parts
     if "runs" in parts:
         runs_idx = parts.index("runs")
-        if runs_idx + 2 >= len(parts):
-            raise ValueError(
-                f"`ckpt` under runs must follow .../runs/<task>/<date_dir>/..., got: {ckpt_path}"
-            )
-        task_name = parts[runs_idx + 1]
-        date_dir = parts[runs_idx + 2]
-        if task_name == "" or date_dir == "":
-            raise ValueError(
-                f"`ckpt` under runs must follow .../runs/<task>/<date_dir>/..., got: {ckpt_path}"
-            )
-        return f"{task_name}_{date_dir}"
+        if runs_idx + 2 < len(parts):
+            task_name = parts[runs_idx + 1]
+            date_dir = parts[runs_idx + 2]
+            if task_name and date_dir:
+                return f"{task_name}_{date_dir}"
+        print(
+            f"[warn] `ckpt` contains a 'runs' component but not the expected "
+            f".../runs/<task>/<date_dir>/... layout ({ckpt_path}); using the file stem."
+        )
     return ckpt_path.stem
 
 

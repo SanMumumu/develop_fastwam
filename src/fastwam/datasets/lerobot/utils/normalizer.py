@@ -6,7 +6,6 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import hashlib
 from pathlib import Path
-from git import Repo
 from fastwam.utils.logging_config import get_logger
 
 from fastwam.utils.pytorch_utils import dict_apply
@@ -241,6 +240,13 @@ def load_dataset_stats_from_json(file_path: str,
 
 
 def search_dataset_stats_cache_json(cache_dir: str | Path, data_config: DictConfig) -> Tuple[bool, str | None]:
+    # NOTE: this helper currently has no callers. GitPython is imported lazily
+    # here rather than at module scope because it raises `ImportError: Bad git
+    # executable` when the `git` binary is absent -- common in slim evaluation
+    # containers -- and this module is imported by robot_video_dataset,
+    # eval_libero_single and deploy_policy, none of which need git.
+    from git import Repo
+
     if isinstance(cache_dir, str):
         cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)

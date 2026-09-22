@@ -1,0 +1,45 @@
+# @package _global_
+#
+# R4 -- oracle upper bound: let Dream ATTEND to the future video tokens.
+#
+# Not a deployable configuration. It changes the attention mask at train AND
+# test time, which breaks the Video+Dream KV prefill and forces a full video
+# forward at inference (the model raises if you try to use infer_action).
+#
+# Its only job is to answer "how much could a perfect DID possibly buy?".
+# If R4 is level with R0, the premise is dead and DID cannot help -- report that
+# result, it is a sharper statement of the paper's own thesis, not a failure.
+defaults:
+  - override /data: libero_goal_2cam
+  - override /model: dream_fastwam_distill
+  - _self_
+
+output_dir: ./runs/dream_distill_libero_goal_r4_oracle/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+batch_size: 32
+num_workers: 4
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 4
+max_steps: null
+log_every: 10
+save_every: 2000
+eval_every: 0
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+# Frozen video expert = a fixed teacher for the DID rungs, and no optimizer
+# state for its 5 B parameters. The video loss then has no trainable parameters
+# upstream, so it contributes no gradient and serves only as a diagnostic.
+freeze_video_expert: true
+
+model:
+  mot_checkpoint_mixed_attn: true
+  loss:
+    # > 0 so the video branch runs over the full clip, matching the DID rungs.
+    lambda_video: 1.0
+    lambda_action: 1.0
+    lambda_dream: 0.1
+  dream_distill:
+    # Structural change, not a loss-weight tweak.
+    dream_video_access: all

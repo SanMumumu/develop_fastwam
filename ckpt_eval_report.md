@@ -33,3 +33,8 @@
 | `dream_goal/2026-07-06_09-53-55_9716/step_003308.pt` | `python scripts/train.py task=dream_fastwam_libero_goal wandb.enabled=true resume=checkpoints/libero_uncond_2cam224_100m.pt num_epochs=4` | 20260707_031737: 95.60%; 20260707_072912: 95.60% |
 | `dream_goal/2026-07-07_07-33-31_22520/step_003308.pt` | `python scripts/train.py task=dream_fastwam_libero_goal wandb.enabled=true resume=checkpoints/libero_uncond_2cam224_100m.pt num_epochs=4 data.train.dream_target.modalities=[depth,dino,sam]` | 20260708_072907: 96.20%; 20260708_083414: 96.80%; 20260708_093745: 96.80% |
 | `dream_goal/2026-07-09_03-51-56_89/step_003308.pt` | `python scripts/train.py task=dream_fastwam_libero_goal wandb.enabled=true resume=checkpoints/libero_uncond_2cam224_100m.pt num_epochs=4 data.train.dream_target.modalities=[depth,dino,sam] model.early_dream_value_retrieval.enabled=true model.early_dream_value_retrieval.early_layers=[0,1,2,3,4] model.early_dream_value_retrieval.target_layers=[10,12,14,16,18,20,22,24,26,28] model.early_dream_value_retrieval.gate_init=0.0` | 20260709_121311: 96.20%; 20260709_141756: 95.60%; 20260709_152659: 95.80% |
+
+> **注意（2026-08 代码审计）**：最后一行的训练命令使用了
+> `model.early_dream_value_retrieval.*` 系列参数，但当前代码库中
+> `grep -rn "early_dream_value_retrieval"` **零命中** —— 该特性不存在于本仓库。
+> 那一行的 96.20% / 95.60% / 95.80% 无法用当前代码复现，除非找回对应分支。

@@ -36,6 +36,15 @@ weight_decay: 0.0
 resume: null
 freeze_video_expert: false
 
+# Optional cluster topology contract. When set, it is the single source of truth
+# for the effective batch size: a launcher can cross-check
+#   num_machines = expected_global_batch_size / (batch_size * grad_accum * gpus_per_node)
+# against the node count in its job manifest, failing fast on disagreement.
+# Also asserted at runtime by Wan22Trainer against the real world size, so a run
+# can never silently train at a different global batch than its recipe claims.
+# Leave null to disable both checks (single-node development).
+expected_global_batch_size: null
+
 # wandb
 wandb:
   enabled: false

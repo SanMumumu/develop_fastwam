@@ -63,11 +63,25 @@ class Wan22Trainer:
         self.wandb_enabled = bool(cfg.wandb.enabled)
         self._weight_checkpoint_loaded_before_optimizer = False
 
+        # Gradient clipping under DeepSpeed is NOT performed by
+        # ``accelerator.clip_grad_norm_``: for ``DistributedType.DEEPSPEED`` that
+        # method ignores ``max_norm`` entirely and only returns the engine's
+        # already-computed global grad norm. The engine does the clipping itself,
+        # but only when ``gradient_clipping`` is present in the DeepSpeed config;
+        # DeepSpeed's default of 0.0 means "disabled". Accelerate resolves the
+        # ``"gradient_clipping": "auto"`` placeholder in our DS JSON from this
+        # environment variable, which must therefore be set *before* the
+        # ``Accelerator`` (and with it the ``DeepSpeedPlugin``) is constructed.
+        # Without this, ``max_grad_norm`` is silently decorative.
+        os.environ["ACCELERATE_GRADIENT_CLIPPING"] = str(self.max_grad_norm)
+
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             mixed_precision=self.mixed_precision,
             step_scheduler_with_optimizer=False,
         )
+        self._assert_gradient_clipping_is_active()
+        self._assert_global_batch_contract()
         
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
         if deepspeed_plugin is None:
@@ -300,6 +314,75 @@ class Wan22Trainer:
         raise RuntimeError(
             "Internal checkpoint ordering error: a weight-only checkpoint reached "
             "post-prepare resume handling without being preloaded."
+        )
+
+    def _assert_gradient_clipping_is_active(self):
+        """Fail fast if the configured ``max_grad_norm`` will not actually clip.
+
+        Under DeepSpeed the clipping is performed inside ``engine.step()`` using
+        the ``gradient_clipping`` entry of the DeepSpeed config, *not* by
+        ``accelerator.clip_grad_norm_``. If that entry is missing (or still holds
+        the unresolved ``"auto"`` placeholder) the model trains completely
+        unclipped while ``configs/train.yaml`` claims otherwise. That failure is
+        silent and expensive, so assert it at construction time instead.
+        """
+        state = self.accelerator.state
+        plugin = getattr(state, "deepspeed_plugin", None)
+        if plugin is None:
+            # Non-DeepSpeed backends go through torch's real clip_grad_norm_.
+            return
+
+        resolved = plugin.deepspeed_config.get("gradient_clipping", None)
+        if resolved is None or resolved == "auto":
+            raise ValueError(
+                "DeepSpeed is active but `gradient_clipping` is unset in the DeepSpeed "
+                f"config (got {resolved!r}). `accelerator.clip_grad_norm_` is a no-op "
+                "under DeepSpeed, so training would run with NO gradient clipping. "
+                "Add `\"gradient_clipping\": \"auto\"` to the DeepSpeed JSON "
+                "(scripts/ds_configs/*.json) so it can be resolved from "
+                "`max_grad_norm`."
+            )
+
+        if abs(float(resolved) - self.max_grad_norm) > 1e-9:
+            raise ValueError(
+                f"DeepSpeed `gradient_clipping`={float(resolved)} disagrees with "
+                f"`max_grad_norm`={self.max_grad_norm}. The DeepSpeed value is the one "
+                "that actually clips; refusing to start with two conflicting settings."
+            )
+        logger.info("Gradient clipping active via DeepSpeed engine: %.4g", float(resolved))
+
+    def _assert_global_batch_contract(self):
+        """Verify the real world size matches the recipe's declared global batch.
+
+        A wrong node count is the classic multi-node failure: the job starts,
+        trains happily, and only the effective batch size is wrong -- which you
+        discover days later from the loss curve. Checking it here costs nothing
+        and fails in seconds instead.
+
+        No-op when `expected_global_batch_size` is unset (single-node dev).
+        """
+        declared = self.cfg.get("expected_global_batch_size", None)
+        if declared is None:
+            return
+
+        declared = int(declared)
+        world_size = int(self.accelerator.num_processes)
+        actual = self.batch_size * world_size * self.gradient_accumulation_steps
+        if actual != declared:
+            raise ValueError(
+                "Global batch size contract violated: "
+                f"batch_size({self.batch_size}) x world_size({world_size}) x "
+                f"gradient_accumulation_steps({self.gradient_accumulation_steps}) = {actual}, "
+                f"but expected_global_batch_size={declared}. Either the job was launched "
+                "with the wrong number of nodes/GPUs, or the recipe's batch fields changed "
+                "without updating expected_global_batch_size."
+            )
+        logger.info(
+            "Global batch contract OK: %d x %d x %d = %d",
+            self.batch_size,
+            world_size,
+            self.gradient_accumulation_steps,
+            declared,
         )
 
     def _load_weight_checkpoint_before_optimizer(self):
