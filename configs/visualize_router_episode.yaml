@@ -1,0 +1,24 @@
+# @package _global_
+defaults:
+  - visualize_dream_episode
+  - override /task: routed_wam_libero_10
+  - _self_
+
+EVALUATION:
+  task_suite_name: libero_10
+  output_dir: ./evaluate_results/router_episode/${now:%Y%m%d_%H%M%S}
+
+VISUALIZATION:
+  require_group_gates: true
+  # The router entry point renders gates first, then Dream into a separate folder.
+  render_after_inference: false
+
+GATE_VISUALIZATION:
+  render_only: false           # reuse raw records from an existing rollout
+  camera: image                # image | wrist_image | both
+  column_width: 320
+  image_height: 224
+  columns_per_page: 8
+  fps: 5                      # replan frames/sec, not simulator realtime
+  save_video: true
+  render_dream_images: true    # raw Dream predictions are always saved as .pt

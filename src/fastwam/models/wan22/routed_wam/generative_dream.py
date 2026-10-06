@@ -7,7 +7,10 @@ so the prediction is the conditional mean and there is nothing to iterate on.
 ``GenerativeDreamExpert`` turns the same module into a *denoiser* over the same
 targets.  The Dream tokens become "identity query + encoded noisy target", the
 expert is conditioned on a Dream diffusion timestep, and the decoders now emit a
-flow-matching velocity instead of a point estimate.  Two things follow:
+flow-matching velocity instead of a point estimate. Each decoder also reads the
+unpooled noisy target at every output location, with timestep conditioning and a
+full-feature residual path; pooled Dream tokens alone cannot retain dense noise.
+Two things follow:
 
 * the action expert can be offered several denoising states of the future, which
   is what makes an action-side router meaningful rather than a fixed re-weighting
@@ -78,6 +81,22 @@ class DreamTargetEncoder(nn.Module):
 
     def _to_token_layout(self, target: torch.Tensor) -> torch.Tensor:
         """[B*O, ...] in decoder output layout -> [B*O, num_output_tokens, F]."""
+        if self.target_layout == "image":
+            decoder = self._decoder_ref[0]
+            if target.ndim != 3 or tuple(target.shape[1:]) != tuple(decoder.target_shape):
+                raise ValueError(
+                    f"{self.modality} image target must be [N,{decoder.target_shape[0]},"
+                    f"{decoder.target_shape[1]}], got {tuple(target.shape)}."
+                )
+            grid_h, grid_w = self.output_grid_shape
+            patch = decoder.patch_size
+            # Inverse of DenseDreamDecoder._unpatchify_image, preserving signed
+            # noisy values and the horizontal two-camera layout.
+            return (
+                target.reshape(target.shape[0], grid_h, patch, grid_w, patch)
+                .permute(0, 1, 3, 2, 4)
+                .reshape(target.shape[0], self.num_output_tokens, self.feature_dim)
+            )
         if self.target_layout == "grid_feature":
             if target.ndim != 4:
                 raise ValueError(
@@ -121,6 +140,30 @@ class DreamTargetEncoder(nn.Module):
         return latent * self.out_scale
 
 
+class DreamDecoderConditioner(nn.Module):
+    """Keep local noise available to the velocity decoder without spatial pooling.
+
+    The full-width skip also preserves feature directions when feature_dim is
+    larger than decoder_dim (e.g. DINO). Its timestep-dependent gain starts at
+    one; the decoder learns the remaining velocity, not the discarded noise.
+    """
+
+    def __init__(self, feature_dim: int, decoder_dim: int, time_dim: int):
+        super().__init__()
+        self.input_proj = nn.Linear(feature_dim, decoder_dim)
+        self.time_proj = nn.Linear(time_dim, decoder_dim)
+        self.skip_gain = nn.Linear(time_dim, feature_dim)
+        nn.init.zeros_(self.skip_gain.weight)
+        nn.init.ones_(self.skip_gain.bias)
+
+    def forward(self, patches: torch.Tensor, time_embedding: torch.Tensor):
+        patches = patches.to(self.input_proj.weight.dtype)
+        time_embedding = time_embedding.to(self.time_proj.weight.dtype)
+        queries = self.input_proj(patches) + self.time_proj(time_embedding).unsqueeze(1)
+        skip = patches * self.skip_gain(time_embedding).unsqueeze(1)
+        return queries, skip
+
+
 class GenerativeDreamExpert(DreamQueryExpert):
     """DreamQueryExpert that denoises its targets instead of regressing them."""
 
@@ -153,17 +196,25 @@ class GenerativeDreamExpert(DreamQueryExpert):
         self.freq_dim_dream = int(generative.get("freq_dim", self.freq_dim))
 
         self.target_encoders = nn.ModuleDict()
+        self.decoder_conditioners = nn.ModuleDict()
         if self.generative_enabled:
             for modality in self.modalities:
                 decoder = self.decoders[modality]
                 if not bool(getattr(decoder, "enabled", True)):
                     continue
+                # A flow velocity is signed even when the clean depth is positive.
+                decoder.nonnegative_depth_output = False
                 self.target_encoders[modality] = DreamTargetEncoder(
                     modality=modality,
                     decoder=decoder,
                     hidden_dim=self.hidden_dim,
                     num_tokens=int(getattr(self, f"n_{modality}")),
                     camera_token_split=self.camera_token_split,
+                )
+                self.decoder_conditioners[modality] = DreamDecoderConditioner(
+                    feature_dim=decoder.feature_dim,
+                    decoder_dim=decoder.decoder_dim,
+                    time_dim=self.hidden_dim,
                 )
             self.dream_time_embedding = nn.Sequential(
                 nn.Linear(self.freq_dim_dream, self.hidden_dim),
@@ -255,6 +306,7 @@ class GenerativeDreamExpert(DreamQueryExpert):
         context_mask: torch.Tensor | None = None,
         noisy_latent: torch.Tensor | None = None,
         timestep: torch.Tensor | None = None,
+        noisy_targets: Dict[str, torch.Tensor] | None = None,
     ) -> Dict[str, Any]:
         pre_state = super().pre_dit(
             batch_size=batch_size,
@@ -264,7 +316,7 @@ class GenerativeDreamExpert(DreamQueryExpert):
             context_mask=context_mask,
         )
         if not self.generative_enabled:
-            if noisy_latent is not None or timestep is not None:
+            if noisy_latent is not None or timestep is not None or noisy_targets is not None:
                 raise ValueError(
                     "noisy_latent/timestep were given but generative.enabled=false."
                 )
@@ -289,6 +341,8 @@ class GenerativeDreamExpert(DreamQueryExpert):
                 raise ValueError(f"`timestep` must be 1D [B], got {tuple(timestep.shape)}.")
             if timestep.shape[0] == 1 and batch_size > 1:
                 timestep = timestep.expand(batch_size)
+            if timestep.shape[0] != batch_size:
+                raise ValueError("Dream timestep must contain one value per sample.")
             embed = self.dream_time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim_dream, timestep).to(
                     dtype=pre_state["tokens"].dtype
@@ -296,5 +350,37 @@ class GenerativeDreamExpert(DreamQueryExpert):
             )
             delta = self.dream_time_projection(embed).unflatten(1, (6, self.hidden_dim))
             pre_state["t_mod"] = pre_state["t_mod"] + delta
+            pre_state["dream_time_embedding"] = embed
+        if noisy_targets is not None:
+            if timestep is None:
+                raise ValueError("Dream decoder noisy_targets require a timestep.")
+            pre_state["noisy_targets"] = noisy_targets
         pre_state["meta"]["generative"] = True
         return pre_state
+
+    def post_dit(self, tokens: torch.Tensor, pre_state: Dict[str, Any]) -> dict[str, torch.Tensor]:
+        if not self.generative_enabled:
+            return super().post_dit(tokens, pre_state)
+        if "noisy_targets" not in pre_state or "dream_time_embedding" not in pre_state:
+            raise ValueError("Generative Dream decoding requires noisy_targets and timestep in pre_dit.")
+        batch_size = tokens.shape[0]
+        offsets = self.num_future_offsets
+        time_embedding = pre_state["dream_time_embedding"].repeat_interleave(offsets, dim=0)
+        conditions, skips = {}, {}
+        for name, conditioner in self.decoder_conditioners.items():
+            decoder = self.decoders[name]
+            target = pre_state["noisy_targets"][name]
+            expected = (batch_size, offsets, *decoder.target_shape)
+            if tuple(target.shape) != expected:
+                raise ValueError(f"{name} noisy target must have shape {expected}, got {tuple(target.shape)}.")
+            flat = target.reshape(batch_size * offsets, *decoder.target_shape)
+            patches = self.target_encoders[name]._to_token_layout(flat)
+            conditions[name], skip = conditioner(patches, time_embedding)
+            if decoder.target_layout == "image":
+                skip = decoder._unpatchify_image(skip)
+            else:
+                skip = skip.reshape(batch_size * offsets, *decoder.target_shape)
+            skips[name] = skip.reshape(expected)
+        decode_state = {**pre_state, "decoder_query_conditions": conditions}
+        residuals = super().post_dit(tokens, decode_state)
+        return {name: residual + skips[name] for name, residual in residuals.items()}

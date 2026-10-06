@@ -20,28 +20,15 @@ dream_scheduler:
   inference_steps: 1
 
 # ------------------------------------------------------------------- router
-# Which imagined tokens the action expert is allowed to read.
-#   none      -- dense, every dream token is read (upper bound / control)
-#   threshold -- parameter-free attention-mass policy (training-free baseline)
-#   learned   -- low-rank bilinear gate, trained with a budget penalty
+# Semantic tanh QK gating (zero initialization), computed once per observation/replan.
+# full / static / dynamic preserve K/V; only Action-to-Dream logits are scaled.
 router:
-  mode: learned
-  rank: 64
-  temperature: 1.0
-  # sigmoid(4) ~ 0.982, so routing starts as a near-identity and has to learn
-  # what to switch off rather than what to switch on.
-  bias_init: 4.0
-  group_granularity: modality_horizon
-  alpha: 1.0
-  min_keep_tokens: 0
-  target_keep_ratio: 0.25
-  lambda_budget: 0.01
-  gate_threshold: 1.0e-3
-  hard_prune_at_inference: true
-  warmup_ratio: 0.1
-  log_statistics: true
-  debug_force_gate: null
-  layers: null
+  mode: none                  # legacy router disabled
+  routing_mode: dynamic
+  router_enabled: true        # false is equivalent to full
+  router_warmup_steps: 0      # optimizer steps; set per training run
+  router_hidden_dim: 128
+  router_gate_loss_weight: 0.0  # Router learns from Action loss without an information cost.
 
 # -------------------------------------------------------- interface distill
 # Compress the multi-step Dream rollout into one forward, supervising the

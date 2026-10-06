@@ -2,8 +2,8 @@
 
 Two things are added on top of :class:`fastwam.models.wan22.mot.MoT`:
 
-1. **Routing.**  Action query rows are materialised explicitly so a per-key gate
-   can be injected additively into the attention logits.  Every other query row
+1. **Routing.**  Action query rows are materialised explicitly. Semantic tanh
+   gates multiply Dream logits; legacy gates add log(gate). Every other query row
    keeps the original fused SDPA path, so the cost of routing is bounded by the
    action chunk length (32 tokens), not by the mixed sequence length.
 
@@ -366,7 +366,42 @@ class RoutedMoT(MoT):
         action_slice: slice,
         context_slices: dict[str, slice],
         layer_idx: int,
+        dream_token_gates: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        feature_router = getattr(self, "feature_router", None)
+        if feature_router is not None and (not feature_router.full or dream_token_gates is not None):
+            if dream_token_gates is None:
+                raise ValueError("Semantic QK attention requires cached Dream token gates.")
+            dream_slice = context_slices["dream"]
+            if dream_token_gates.shape != (q_action.shape[0], dream_slice.stop - dream_slice.start):
+                raise ValueError("Dream QK gates must be [batch, dream_tokens].")
+            mask = attention_mask[action_slice, :].to(device=q_action.device)
+            if mask.dtype != torch.bool:
+                raise TypeError("Semantic QK routing requires a boolean attention mask.")
+
+            def attend(q, k, v, gates):
+                with torch.autocast(device_type=q.device.type, enabled=False):
+                    b = q.shape[0]
+                    def heads(x):
+                        return x.float().reshape(b, -1, self.num_heads, self.attn_head_dim).transpose(1, 2)
+                    scores = (heads(q) @ heads(k).transpose(-2, -1)) * (self.attn_head_dim ** -0.5)
+                    scores = torch.cat([
+                        scores[..., :dream_slice.start],
+                        scores[..., dream_slice] * gates.float()[:, None, None, :],
+                        scores[..., dream_slice.stop:],
+                    ], dim=-1)
+                    # Apply masks AFTER scaling: zero gates must never create 0 * -inf.
+                    scores = scores.masked_fill(~mask, -torch.inf)
+                    # Match SDPA's zero output for a fully masked query row.
+                    scores = scores.masked_fill(~mask.any(dim=-1, keepdim=True), 0)
+                    probabilities = scores.softmax(dim=-1).masked_fill(~mask, 0)
+                    output = probabilities @ heads(v)
+                    return output.transpose(1, 2).reshape(b, q.shape[1], -1).to(q.dtype)
+
+            if self.mot_checkpoint_mixed_attn and self.training:
+                return torch.utils.checkpoint.checkpoint(
+                    attend, q_action, k_all, v_all, dream_token_gates, use_reentrant=False)
+            return attend(q_action, k_all, v_all, dream_token_gates)
         if not self.routing_enabled:
             return super()._action_attention_with_context_cache(
                 q_action=q_action,
@@ -386,6 +421,10 @@ class RoutedMoT(MoT):
             dream_slice=context_slices["dream"],
             layer_idx=layer_idx,
         )
+        # Stage-1 training uses this cached path rather than forward(). Keep
+        # the differentiable gates as well as the detached logging statistics,
+        # so the budget loss can train the same gates used by Action attention.
+        self.last_gates.append(gate_info["gate"])
         if self.router is not None:
             self.router.record(
                 layer_idx=layer_idx,
@@ -396,6 +435,8 @@ class RoutedMoT(MoT):
         return out
 
     def forward_action_with_context_cache(self, *args, **kwargs) -> torch.Tensor:
+        # Each Action forward (or denoising step) owns a fresh gate graph.
+        self.last_gates = []
         if self.router is not None:
             self.router.reset_statistics()
         return super().forward_action_with_context_cache(*args, **kwargs)

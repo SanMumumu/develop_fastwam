@@ -42,10 +42,13 @@ def create_routed_wam(
     generative_dream: dict[str, Any] | DictConfig | None = None,
     dream_scheduler: dict[str, Any] | DictConfig | None = None,
     finetune_action_only: bool = False,
+    training_mode: str = "joint",
+    active_dream_modalities=None,
     **dream_fastwam_kwargs,
 ) -> RoutedWAM:
     """Build a dense DreamFastWAM and promote it to a RoutedWAM."""
     dense_model = create_dream_fastwam(**dream_fastwam_kwargs)
+    dense_model.set_active_dream_modalities(active_dream_modalities)
     return RoutedWAM.from_dense_model(
         dense_model,
         router=_to_container(router),
@@ -53,6 +56,7 @@ def create_routed_wam(
         generative_dream=_to_container(generative_dream),
         dream_scheduler=_to_container(dream_scheduler),
         finetune_action_only=bool(finetune_action_only),
+        training_mode=training_mode,
     )
 
 
@@ -68,6 +72,8 @@ def run_routed_training(cfg: DictConfig) -> None:
         OmegaConf.save(config_payload, handle)
 
     model_device = _resolve_train_device()
+    from .utils.pytorch_utils import set_global_seed
+    set_global_seed(int(cfg.seed), get_worker_init_fn=False)
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
@@ -91,4 +97,16 @@ def run_routed_training(cfg: DictConfig) -> None:
         train_dataset=train_ds,
         val_dataset=val_ds,
     )
+    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+    before = None
+    if unwrapped.training_mode == "router_only" and trainer.accelerator.is_main_process:
+        from .utils.routing_experiment import frozen_checksum
+        before = frozen_checksum(unwrapped)
+    trainer.accelerator.wait_for_everyone()
     trainer.train()
+    if before is not None:
+        from .utils.routing_experiment import atomic_json
+        after = frozen_checksum(unwrapped)
+        atomic_json(Path(cfg.output_dir) / "frozen_check.json", {"before": before, "after": after, "unchanged": before == after})
+        if before != after:
+            raise RuntimeError("Frozen backbone parameters changed during Router-only training.")

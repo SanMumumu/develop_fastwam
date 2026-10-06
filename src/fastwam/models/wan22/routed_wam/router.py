@@ -1,5 +1,10 @@
 """Action-side routing over the imagination interface.
 
+`DynamicFeatureRouter` implements full/static/dynamic semantic QK gating:
+one [B,16] vector from stable control context, shared across layers and noise
+steps. The remainder of this introduction describes the legacy router retained
+for old configurations (`routing_mode=null`).
+
 The action expert in a DreamFastWAM MoT reads the world branch only through the
 per-layer keys/values of the Video and Dream tokens.  `ImaginationRouter` lets
 the action expert decide, per layer and per sample, *which* of those Dream keys
@@ -56,6 +61,13 @@ class RouterConfig:
     """Configuration for :class:`ImaginationRouter`."""
 
     mode: str = "none"
+    # Semantic QK routing. None selects the legacy router above.
+    routing_mode: Optional[str] = None
+    router_enabled: bool = True
+    router_warmup_steps: int = 0
+    router_hidden_dim: int = 128
+    router_gate_loss_weight: float = 0.0
+    gate_init_probability: float = 0.5  # Deprecated; accepted for old configs. QK gates always start at zero.
     # --- threshold mode ---
     alpha: float = 1.0
     # --- learned mode ---
@@ -77,6 +89,14 @@ class RouterConfig:
     @classmethod
     def from_dict(cls, value: Optional[dict[str, Any]]) -> "RouterConfig":
         cfg = cls(**({} if value is None else dict(value)))
+        if cfg.routing_mode not in (None, "full", "static", "dynamic"):
+            raise ValueError("routing_mode must be full, static, dynamic, or null (legacy).")
+        if cfg.routing_mode is not None and cfg.mode != "none":
+            raise ValueError("Semantic routing requires router.mode=none; legacy routing cannot also run.")
+        if cfg.router_warmup_steps < 0 or cfg.router_hidden_dim <= 0 or cfg.router_gate_loss_weight < 0:
+            raise ValueError("Invalid router warmup, hidden dimension, or gate loss weight.")
+        if not 0 < cfg.gate_init_probability < 1:
+            raise ValueError("gate_init_probability must be strictly between zero and one.")
         if cfg.mode not in ROUTER_MODES:
             raise ValueError(f"router.mode must be one of {ROUTER_MODES}, got {cfg.mode!r}.")
         if cfg.alpha < 0:
@@ -409,3 +429,129 @@ class ImaginationRouter(nn.Module):
             if values:
                 metrics[f"router_keep_{name}"] = sum(values) / len(values)
         return metrics
+
+
+class DynamicFeatureRouter(nn.Module):
+    """One semantic gate per modality/view/horizon, shared by the entire action solve.
+
+    Legacy ImaginationRouter remains available for old experiments. This module
+    never reads action noise, prunes tokens, or normalizes across groups.
+    """
+
+    modality_order = ("dino", "dyn", "sam", "depth")
+    activation_names = ("dino_activation", "tracker_activation", "sam_activation", "depth_activation")
+
+    def __init__(self, *, config: RouterConfig, input_dim: int, dream_expert):
+        super().__init__()
+        self.config = config
+        if config.routing_mode is None:
+            raise ValueError("DynamicFeatureRouter requires an explicit routing_mode.")
+        if set(dream_expert.modalities) != set(self.modality_order):
+            raise ValueError("16-group routing requires dyn, depth, dino, sam.")
+        split = dream_expert.camera_token_split
+        if split is None or len(split) != 2 or len(set(dream_expert.future_offsets)) != 2:
+            raise ValueError("16-group routing requires two camera groups and two future offsets.")
+        self.group_mapping = []
+        token_groups = []
+        for modality in dream_expert.modalities:
+            if sum(split) != getattr(dream_expert, f"n_{modality}"):
+                raise ValueError("Camera token split does not match the Dream layout.")
+            for offset in dream_expert.future_offsets:
+                for view, count in zip(("primary", "wrist"), split):
+                    group_id = len(self.group_mapping)
+                    start = len(token_groups)
+                    token_groups.extend([group_id] * count)
+                    self.group_mapping.append(dict(
+                        group_id=group_id, modality=modality, view=view,
+                        future_offset=int(offset), token_start=start, token_stop=len(token_groups),
+                    ))
+        if len(self.group_mapping) != 16:
+            raise ValueError("Expected exactly 16 semantic groups.")
+        self.register_buffer("group_ids", torch.tensor(token_groups, dtype=torch.long), persistent=False)
+        self.register_buffer("modality_indices", torch.tensor([
+            [g["group_id"] for g in self.group_mapping if g["modality"] == m]
+            for m in self.modality_order
+        ]), persistent=False)
+        self.gate_prior = nn.Parameter(torch.zeros(16))
+        self.network = nn.Sequential(
+            nn.LayerNorm(input_dim), nn.Linear(input_dim, config.router_hidden_dim),
+            nn.GELU(), nn.Linear(config.router_hidden_dim, 16),
+        ) if config.routing_mode == "dynamic" else None
+        if self.network is not None:
+            nn.init.zeros_(self.network[-1].weight)
+            nn.init.zeros_(self.network[-1].bias)
+        self.global_step = 0
+        if self.full:
+            self.requires_grad_(False)
+
+    def _apply(self, fn, recurse=True):
+        # DeepSpeed calls model.bfloat16() before building ZeRO partitions.
+        # Keep the small semantic router in FP32, including through parent .to().
+        # Use the original tensor when converting back to avoid BF16 rounding.
+        def preserve_precision(tensor):
+            converted = fn(tensor)
+            if tensor.is_floating_point():
+                return tensor.to(device=converted.device, dtype=torch.float32)
+            return converted
+        return super()._apply(preserve_precision, recurse=recurse)
+
+    @torch.no_grad()
+    def reset_zero(self):
+        """Fresh stage-two router: every input starts with zero Dream QK scale."""
+        self.gate_prior.zero_()
+        if self.network is not None:
+            for module in self.network:
+                if hasattr(module, "reset_parameters"):
+                    module.reset_parameters()
+            nn.init.zeros_(self.network[-1].weight)
+            nn.init.zeros_(self.network[-1].bias)
+
+    @property
+    def full(self):
+        return not self.config.router_enabled or self.config.routing_mode == "full"
+
+    def warming_up(self, training: bool) -> bool:
+        return training and self.global_step < self.config.router_warmup_steps
+
+    def forward(self, context: torch.Tensor, *, training: bool = False) -> torch.Tensor:
+        if context.ndim != 2:
+            raise ValueError("Router context must be [B,D].")
+        if self.full:
+            return context.new_ones((context.shape[0], 16), dtype=torch.float32)
+        # A zero dependency keeps DDP's parameter participation stable across
+        # warmup, without allowing either action or gate loss to train gates yet.
+        logits = self.gate_prior.expand(context.shape[0], -1)
+        if self.network is not None:
+            with torch.autocast(device_type=context.device.type, enabled=False):
+                logits = logits + self.network(context.float())
+        if self.warming_up(training):
+            return logits.float() * 0.0
+        return torch.tanh(logits.float())
+
+    def gate_loss(self, gates: torch.Tensor, *, training: bool) -> torch.Tensor:
+        if self.full or self.warming_up(training):
+            return gates.sum() * 0.0
+        return gates.abs().mean()
+
+    def activations(self, gates: torch.Tensor) -> torch.Tensor:
+        if gates.ndim != 2 or gates.shape[1] != 16:
+            raise ValueError("Group gates must be [B,16].")
+        return gates[:, self.modality_indices].mean(dim=-1)
+
+    def gate_cache(self, cache: dict, gates: torch.Tensor) -> dict:
+        """Attach QK scales for Action; preserve all raw K/V tensors."""
+        activations = self.activations(gates)  # also validate the public gate shape
+        nv, nd = cache["video_seq_len"], cache["dream_seq_len"]
+        if nd != self.group_ids.numel():
+            raise ValueError("Dream cache token count does not match the group mapping.")
+        weights = gates[:, self.group_ids]
+        bypass = self.full and bool(torch.all(gates == 1))
+        layers = []
+        for layer in cache["kv_cache"]:
+            value = layer["v"]
+            if value.shape[1] != nv + nd or value.shape[0] != gates.shape[0]:
+                raise ValueError("Action context cache shape does not match gates/layout.")
+            layers.append(dict(layer) if bypass else {**layer, "dream_token_gates": weights})
+        return {**cache, "kv_cache": layers, "group_gates": gates,
+                "modality_activations": activations,
+                "group_mapping": self.group_mapping}

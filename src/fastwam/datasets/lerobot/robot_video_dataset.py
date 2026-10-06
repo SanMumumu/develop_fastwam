@@ -701,8 +701,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         dream_target=None,
         action_stats_correlation_beta: float = 0.5,
         action_stats_correlation_jitter: float = 1e-5,
+        episode_manifest: Optional[str] = None,
+        routing_noise_seed: Optional[int] = None,
     ):
         self.dataset_name = dataset_name
+        self.routing_noise_seed = routing_noise_seed
         dataset_dirs = resolve_lerobot_dataset_dirs(dataset_dirs)
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -712,6 +715,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
+            episode_manifest=episode_manifest,
+            strict_loading=episode_manifest is not None,
         )
     
         self.num_frames = num_frames
@@ -766,9 +771,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             else:
                 dataset_stats = load_dataset_stats_from_json(pretrained_norm_stats)
                 logger.info(f"Using dataset stats: {pretrained_norm_stats}")
-                if PartialState().is_main_process:
+                # Validation consumes the training stats; never rewrite them
+                # while other ranks are still opening the same JSON.
+                if is_training_set and PartialState().is_main_process:
                     work_dir = misc.get_work_dir()
-                    save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
+                    output_stats = Path(work_dir) / "dataset_stats.json"
+                    if Path(pretrained_norm_stats).resolve() != output_stats.resolve():
+                        save_dataset_stats_to_json(dataset_stats, str(output_stats))
 
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)
@@ -927,6 +936,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if self.routing_noise_seed is not None:
+            for key in ("dataset_index", "episode_index", "frame_index"):
+                data[key] = sample[key]
+            data["routing_sample_id"] = (sample["dataset_index"] * 10**12
+                                         + sample["episode_index"] * 10**6 + sample["frame_index"])
+            data["routing_noise_seed"] = int(self.routing_noise_seed)
         dream_targets = self.dream_target_adapter.build(sample)
         if dream_targets is not None:
             data["dream_targets"] = dream_targets

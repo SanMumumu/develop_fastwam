@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - dense_router_libero_10_full
+  - _self_
+output_dir: ./runs/dense_router_libero_10/static
+resume: ${experiment.baseline_dir}/checkpoints/weights/step_001600.pt
+max_steps: 400
+weight_decay: 0.0
+router_learning_rate: 1.0e-3  # 10x the Dream/Action peak LR; dynamic inherits this.
+reset_router_on_weight_load: true  # Stage transition: discard the Full-Dream router prior.
+experiment:
+  training_mode: dense_joint
+data:
+  train:
+    pretrained_norm_stats: ${experiment.baseline_dir}/dataset_stats.json
+model:
+  router:
+    routing_mode: static

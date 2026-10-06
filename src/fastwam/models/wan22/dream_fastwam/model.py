@@ -380,6 +380,17 @@ class DreamFastWAM(FastWAM):
                 f"targets={sorted(target_modalities)} model={sorted(model_modalities)}"
             )
 
+    def set_active_dream_modalities(self, modalities=None) -> None:
+        """Isolate disabled token groups without changing parameters or token layout."""
+        available = tuple(self.dream_expert.modalities)
+        active = available if modalities is None else tuple(modalities)
+        if len(set(active)) != len(active) or set(active) - set(available):
+            raise ValueError(f"Invalid active Dream modalities: {active}; available={available}")
+        for name in set(available) - set(active):
+            if self.loss_lambda_dream * getattr(self, f"loss_lambda_{name}") != 0:
+                raise ValueError(f"Disabled Dream modality {name} must have zero supervision weight.")
+        self.active_dream_modalities = active
+
     @torch.no_grad()
     def _build_mot_attention_mask(
         self,
@@ -420,6 +431,17 @@ class DreamFastWAM(FastWAM):
         mask[action_start:, :current_frame_tokens] = True
         mask[action_start:, dream_start:action_start] = True
         mask[action_start:, action_start:] = True
+        active = getattr(self, "active_dream_modalities", self.dream_expert.modalities)
+        for name, slc in self.dream_expert.modality_slices().items():
+            if name in active:
+                continue
+            disabled = slice(dream_start + slc.start, dream_start + slc.stop)
+            # No active stream can read disabled K/V. Isolate disabled queries
+            # too, keeping self-only rows to avoid fully masked attention rows.
+            mask[:, disabled] = False
+            mask[disabled, :] = False
+            indices = torch.arange(disabled.start, disabled.stop, device=device)
+            mask[indices, indices] = True
         return mask
 
     def _compute_dream_loss(
@@ -1019,6 +1041,10 @@ class DreamFastWAM(FastWAM):
         )
         return self.action_expert.post_dit(action_tokens, action_pre)
 
+    def _prepare_action_cache(self, cache, *, context, context_mask, proprio=None, training=False):
+        """Optional action-side adapter; the unadapted model uses the raw cache."""
+        return cache
+
     @torch.no_grad()
     def infer_action(
         self,
@@ -1121,6 +1147,9 @@ class DreamFastWAM(FastWAM):
             return_dream=return_dream_predictions,
         )
 
+        video_dream_cache = self._prepare_action_cache(
+            video_dream_cache, context=context, context_mask=context_mask, proprio=proprio,
+        )
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
@@ -1140,6 +1169,12 @@ class DreamFastWAM(FastWAM):
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
         output = {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}
+        if "group_gates" in video_dream_cache:
+            output["group_gates"] = video_dream_cache["group_gates"].detach().float().cpu()
+            activations = video_dream_cache["modality_activations"].detach().float().cpu()
+            for index, name in enumerate(("dino", "tracker", "sam", "depth")):
+                output[f"{name}_activation"] = activations[:, index]
+            output["group_mapping"] = video_dream_cache["group_mapping"]
         if return_dream_predictions:
             if dream_predictions is None:
                 raise RuntimeError(
@@ -1150,6 +1185,10 @@ class DreamFastWAM(FastWAM):
                 for name, value in dream_predictions.items()
             }
             output["future_offsets"] = list(self.dream_expert.future_offsets)
+            output["dyn_camera_layout"] = (
+                getattr(self.dream_expert.decoders["dyn"], "camera_layout", "horizontal")
+                if "dyn" in getattr(self.dream_expert, "decoders", {}) else None
+            )
             output["camera_token_split"] = (
                 None
                 if self.dream_expert.camera_token_split is None

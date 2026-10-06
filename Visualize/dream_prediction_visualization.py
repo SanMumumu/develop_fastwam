@@ -10,6 +10,7 @@ import torch
 
 from Visualize.modality_visualization import (
     depth_colormap,
+    dynamic_heatmap,
     fit_kmeans_projection,
     fit_pca_projection,
     overlay_dynamic_heatmap,
@@ -82,6 +83,7 @@ def _unpatchify_depth(patch_grid: np.ndarray) -> np.ndarray:
 def split_prediction_views(
     modality: str,
     prediction: Any,
+    camera_layout: str = "horizontal",
 ) -> dict[str, np.ndarray]:
     """Split one horizon prediction into primary and wrist camera arrays."""
     array = _as_numpy(prediction)
@@ -98,7 +100,11 @@ def split_prediction_views(
             primary = _unpatchify_depth(primary_grid)
             wrist = _unpatchify_depth(wrist_grid)
     elif modality == "dyn":
-        primary_grid, wrist_grid = _split_flat_square_views(array)
+        if camera_layout == "camera_major":
+            side = int(round((array.shape[0] // 2) ** 0.5))
+            primary_grid, wrist_grid = array.reshape(2, side, side, -1)
+        else:
+            primary_grid, wrist_grid = _split_flat_square_views(array)
         primary = primary_grid.squeeze(-1)
         wrist = wrist_grid.squeeze(-1)
     else:
@@ -159,6 +165,11 @@ def fit_episode_projections(
         projections["sam"] = fit_kmeans_projection(
             samples, clusters=sam_clusters
         )
+        # fit_kmeans_projection normalizes its input in place. Fit PCA from
+        # fresh, unnormalised samples to preserve the raw feature distribution.
+        projections["sam_pca"] = fit_pca_projection(_sample_rows(
+            modality_arrays["sam"], max_samples=max_projection_samples, seed=1
+        ))
     if depth_values:
         all_depth = np.concatenate(depth_values)
         projections["depth_range"] = tuple(
@@ -193,6 +204,8 @@ def _render_prediction(
     alpha: float,
     sam_clusters: int,
     draw_contours: bool,
+    prediction_mode: str = "regression",
+    sam_render_mode: str = "regions",
 ) -> np.ndarray:
     if modality == "depth":
         colored = depth_colormap(
@@ -201,7 +214,14 @@ def _render_prediction(
         )
         return colored
     if modality == "dyn":
-        probability = 1.0 / (1.0 + np.exp(-np.clip(value, -30.0, 30.0)))
+        if prediction_mode == "flow_matching":
+            # Final flow samples approximate binary target values, not logits.
+            # Clip for display only; raw records retain out-of-range samples.
+            probability = np.clip(value, 0.0, 1.0)
+        else:
+            probability = 1.0 / (1.0 + np.exp(-np.clip(value, -30.0, 30.0)))
+        if alpha == 1.0:
+            return dynamic_heatmap(probability, output_hw=rgb.shape[:2], scale=1.0)[0]
         return overlay_dynamic_heatmap(rgb, probability, alpha=alpha, scale=1.0)
     if modality == "dino":
         return overlay_feature_pca(
@@ -212,6 +232,11 @@ def _render_prediction(
             alpha=alpha,
         )
     if modality == "sam":
+        if sam_render_mode == "pca":
+            return overlay_feature_pca(
+                rgb, value, value.shape[:2],
+                projection=projections.get("sam_pca"), alpha=alpha,
+            )
         return overlay_embedding_regions(
             rgb,
             value,
@@ -232,7 +257,10 @@ def render_record_grid(
     alpha: float,
     sam_clusters: int,
     draw_contours: bool,
+    sam_render_mode: str = "regions",
 ) -> np.ndarray:
+    if sam_render_mode not in {"regions", "pca"}:
+        raise ValueError("sam_render_mode must be 'regions' or 'pca'.")
     rgb_by_camera = {
         camera: _uint8_rgb(record["rgb"][camera]) for camera in CAMERAS
     }
@@ -257,7 +285,8 @@ def render_record_grid(
                 f"future_offsets={future_offsets}."
             )
         for horizon_index, offset in enumerate(future_offsets):
-            split = split_prediction_views(modality, values[horizon_index])
+            split = split_prediction_views(modality, values[horizon_index],
+                camera_layout=record.get("metadata", {}).get("dyn_camera_layout", "horizontal"))
             row = []
             for camera in CAMERAS:
                 rendered = _render_prediction(
@@ -268,11 +297,13 @@ def render_record_grid(
                     alpha=alpha,
                     sam_clusters=sam_clusters,
                     draw_contours=draw_contours,
+                    prediction_mode=record.get("metadata", {}).get("dream_prediction_mode", "regression"),
+                    sam_render_mode=sam_render_mode,
                 )
                 row.append(
                     _add_label(
                         _resize_panel(rendered, panel_size),
-                        f"{camera} predicted {modality} t+{offset}",
+                        f"{camera} {modality}{' ' + sam_render_mode if modality == 'sam' else ''} t+{offset}",
                     )
                 )
             rows.append(row)
@@ -316,8 +347,18 @@ def render_saved_episode(
     sam_clusters: int = 8,
     draw_contours: bool = True,
     max_projection_samples: int = 2048,
+    sam_render_mode: str = "regions",
 ) -> dict[str, str]:
     records = load_episode_records(raw_dir)
+    records = [record for record in records if record.get("dream_predictions")]
+    if not records:
+        return {"reason": "No Dream predictions were captured."}
+    manifest_path = Path(raw_dir).parent / "episode_manifest.json"
+    if manifest_path.exists():
+        success = json.loads(manifest_path.read_text()).get("success")
+        if success is not None:
+            for record in records:
+                record.setdefault("metadata", {})["success"] = bool(success)
     projections = fit_episode_projections(
         records,
         sam_clusters=sam_clusters,
@@ -335,6 +376,7 @@ def render_saved_episode(
         alpha=alpha,
         sam_clusters=sam_clusters,
         draw_contours=draw_contours,
+        sam_render_mode=sam_render_mode,
     )
     writer = cv2.VideoWriter(
         str(video_path),
@@ -353,6 +395,7 @@ def render_saved_episode(
             alpha=alpha,
             sam_clusters=sam_clusters,
             draw_contours=draw_contours,
+            sam_render_mode=sam_render_mode,
         )
         frame_path = frame_dir / f"replan_{index:04d}.png"
         cv2.imwrite(str(frame_path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
@@ -363,6 +406,8 @@ def render_saved_episode(
         "video": str(video_path),
         "frames": str(frame_dir),
         "num_replans": str(len(records)),
+        "sam_render_mode": sam_render_mode,
+        "overlay_alpha": str(alpha),
     }
     (output_dir / "render_manifest.json").write_text(
         json.dumps(result, indent=2), encoding="utf-8"

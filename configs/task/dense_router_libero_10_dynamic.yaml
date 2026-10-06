@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - dense_router_libero_10_static
+  - _self_
+output_dir: ./runs/dense_router_libero_10/dynamic
+model:
+  router:
+    routing_mode: dynamic
