@@ -5,14 +5,13 @@ defaults:
 _target_: fastwam.routed_runtime.create_routed_wam
 
 # ---------------------------------------------------------------- generative
-# The Dream expert denoises its multi-modal targets instead of regressing them.
-# With `enabled: false` the model is behaviourally identical to dream_fastwam.
+# Dream directly regresses future targets in one forward, without Dream noise.
+# Generative Dream remains available only for explicitly selected legacy tasks.
 generative_dream:
-  enabled: true
+  enabled: false
   freq_dim: 256
 
-# Flow-matching schedule for the Dream branch. `inference_steps: 1` is the
-# deployed setting; interface distillation is what makes one step sufficient.
+# Used only when generative_dream.enabled=true; unused by direct regression.
 dream_scheduler:
   train_shift: 5.0
   infer_shift: 5.0
@@ -20,13 +19,25 @@ dream_scheduler:
   inference_steps: 1
 
 # ------------------------------------------------------------------- router
-# Semantic tanh QK gating (zero initialization), computed once per observation/replan.
-# full / static / dynamic preserve K/V; only Action-to-Dream logits are scaled.
+# Learned priors: va = Video + Action, da = Dream + Action, static = learned constants.
+# The existing shared mixed softmax receives +log(gate) on Dream columns only.
 router:
-  mode: none                  # legacy router disabled
-  routing_mode: dynamic
-  router_enabled: true        # false is equivalent to full
-  router_warmup_steps: 0      # optimizer steps; set per training run
+  mode: learned
+  routing_mode: null
+  gate_type: va              # va | da | static; mode=none disables these priors.
+  group_granularity: modality_horizon_view
+  rank: 64
+  temperature: 1.0
+  bias_init: 4.0
+  warmup_ratio: 0.1
+  lambda_budget: 0.0          # Router learns exclusively through Action loss.
+  gate_threshold: 1.0e-3
+  hard_prune_at_inference: true
+  min_keep_tokens: 0
+  log_statistics: true
+  # Compatibility settings for explicitly selected full/static/dynamic QK tasks.
+  router_enabled: true
+  router_warmup_steps: 0
   router_hidden_dim: 128
   router_gate_loss_weight: 0.0  # Router learns from Action loss without an information cost.
 
@@ -48,3 +59,4 @@ interface_distill:
   detach_teacher: true
 
 finetune_action_only: false
+training_mode: dense_joint

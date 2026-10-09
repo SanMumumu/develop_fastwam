@@ -1,9 +1,7 @@
 # @package _global_
 #
-# Stage 1: train the generative, routed imagination on LIBERO-goal.
-# The Dream branch denoises depth/DINO/SAM/dyn futures and the action expert
-# learns which of them to read. Interface distillation is added in stage 2
-# (routed_wam_libero_goal_distill).
+# Train regression Dream and Video/Action group routing on LIBERO-goal.
+# Dream directly predicts depth/DINO/SAM/dyn futures; Video stays frozen.
 
 defaults:
   - override /data: libero_goal_2cam
@@ -23,7 +21,7 @@ save_every: 2000
 eval_every: 0
 gradient_accumulation_steps: 1
 weight_decay: 1e-2
-resume: null
+resume: ./checkpoints/libero_uncond_2cam224_100m.pt
 # The split Video-once prefill is only exact while the Video expert's K/V do not
 # depend on the diffusion step, which requires it to stay frozen.
 freeze_video_expert: true

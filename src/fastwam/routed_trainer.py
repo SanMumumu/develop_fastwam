@@ -40,8 +40,8 @@ class RoutedWan22Trainer(Wan22Trainer):
         router_lr = self.cfg.get("router_learning_rate")
         if router_lr is not None and (not math.isfinite(float(router_lr)) or float(router_lr) <= 0):
             raise ValueError("router_learning_rate must be finite and positive, or null.")
-        router = getattr(model.mot, "feature_router", None)
-        router_ids = {id(p) for p in router.parameters()} if router is not None else set()
+        routers = [getattr(model.mot, name, None) for name in ("feature_router", "router")]
+        router_ids = {id(p) for router in routers if router is not None for p in router.parameters()}
         # ZeRO flattens each optimizer group. Separate dtypes so FP32 router
         # parameters cannot be packed into the BF16 expert parameter buffer.
         groups = {}
@@ -79,9 +79,10 @@ class RoutedWan22Trainer(Wan22Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         model = self.accelerator.unwrap_model(self.model)
-        router = getattr(model.mot, "feature_router", None)
-        if router is not None and any(p.dtype != torch.float32 for p in router.parameters()):
-            raise RuntimeError("Semantic Router must remain FP32 after accelerator.prepare().")
+        for name in ("feature_router", "router"):
+            router = getattr(model.mot, name, None)
+            if router is not None and any(p.dtype != torch.float32 for p in router.parameters()):
+                raise RuntimeError("Router must remain FP32 after accelerator.prepare().")
         if not hasattr(model, "set_training_progress_provider"):
             raise TypeError("RoutedWan22Trainer requires a RoutedWAM.")
         model.set_training_progress_provider(

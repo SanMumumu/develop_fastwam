@@ -1,7 +1,7 @@
 # @package _global_
 #
-# Stage 2: interface distillation on LIBERO-goal.
-# Resume from a stage-1 routed checkpoint and train the one-step student Dream
+# Legacy generative experiment: interface distillation on LIBERO-goal.
+# Resume from a generative stage-1 checkpoint and train the one-step student Dream
 # pass to reproduce the per-layer Dream K/V of an 8-step EMA teacher. Inference
 # then runs `dream_scheduler.inference_steps: 1`.
 
@@ -29,6 +29,9 @@ freeze_video_expert: true
 
 model:
   mot_checkpoint_mixed_attn: true
+  training_mode: joint
+  generative_dream:
+    enabled: true
   dream_scheduler:
     inference_steps: 1
   interface_distill:

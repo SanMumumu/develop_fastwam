@@ -9,8 +9,8 @@
 REMOTE_IP="218.200.126.238"        # 远程服务器IP
 REMOTE_USER="txc"                   # 登录用户名
 SSH_PORT="39118"                   # SSH端口
-REMOTE_PATH="/mnt/data/txc/FastWAM/data/libero_mujoco3.3.2"  # 要拉取的远程目录
-LOCAL_PATH="/mnt/hwdata/txc/FastWAM/data/libero_mujoco3.3.2"                    # 本地保存路径
+REMOTE_PATH="/mnt/data/txc/FastWAM/data/RoboTwin-Clean"  # 要拉取的远程目录
+LOCAL_PATH="/mnt/hwdata/txc/FastWAM/data/RoboTwin-Clean-1"                    # 本地保存路径
 RSYNC_OPTS="-avuz --progress"       # rsync参数
 LOG_DIR="/mnt/hwdata/txc/tool/rsync_log"   # 日志目录
 

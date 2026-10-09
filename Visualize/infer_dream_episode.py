@@ -173,10 +173,12 @@ def run_one_episode(cfg: DictConfig) -> dict[str, Any]:
             "Dream episode visualization requires DreamFastWAM or RoutedWAM with a dream_expert."
         )
     if bool(cfg.VISUALIZATION.get("require_group_gates", False)):
-        if getattr(getattr(model, "mot", None), "feature_router", None) is None:
+        mot = getattr(model, "mot", None)
+        router = getattr(mot, "router", None)
+        if (getattr(mot, "feature_router", None) is None
+                and not (router is not None and router.config.mode == "learned")):
             raise ValueError(
-                "Gate visualization requires a semantic full/static/dynamic Router checkpoint. "
-                "This run has no 16-group router; use a checkpoint trained with the new router."
+                "Gate visualization requires a learned group or full/static/dynamic Router checkpoint."
             )
     inference_metadata = _dream_inference_metadata(model, cfg)
 
@@ -300,7 +302,8 @@ def run_one_episode(cfg: DictConfig) -> dict[str, Any]:
                 record["routing"] = {key: prediction[key] for key in (
                     "group_gates", "group_mapping", "dino_activation", "tracker_activation",
                     "sam_activation", "depth_activation",
-                )}
+                    "group_gates_per_layer", "gate_kind", "gate_denoising_step", "gate_layer_reduction",
+                ) if key in prediction}
             torch.save(record, record_path)
             record_paths.append(record_path)
             replan_index += 1

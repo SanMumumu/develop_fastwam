@@ -5,7 +5,7 @@ set -euo pipefail
 usage() {
   printf '用法：bash scripts/train_dream_ablation.sh <实验 ID> [--dry-run]\n'
   printf '实验 ID：none dyn depth dino sam all all_no_sup\n'
-  printf '默认使用 GPU 0,1,2,3；请先激活 fastwam 环境。\n'
+  printf '默认使用 GPU 0,1,2,3；缺少 accelerate 时自动使用 fastwam Conda 环境。\n'
 }
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -48,15 +48,28 @@ command=(
   resume=./checkpoints/libero_uncond_2cam224_100m.pt
   seed=42
   batch_size=32 gradient_accumulation_steps=2
-  expected_global_batch_size=256 max_steps=5000
+  expected_global_batch_size=256 max_steps=4000
   learning_rate=1e-4 weight_decay=1e-2
-  save_every=2000 log_every=10 eval_every=0
+  save_every=1500 log_every=10 eval_every=0
   "model.active_dream_modalities=$active"
   "model.loss.lambda_dyn=$dyn"
   "model.loss.lambda_depth=$depth"
   "model.loss.lambda_dino=$dino"
   "model.loss.lambda_sam=$sam"
 )
+
+# Use the installed fastwam environment when the current shell lacks Accelerate.
+if ! command -v accelerate >/dev/null 2>&1; then
+  conda_exe="${CONDA_EXE:-}"
+  if [[ ! -x "$conda_exe" ]]; then
+    conda_exe="$(type -P conda || true)"
+  fi
+  if [[ -z "$conda_exe" ]]; then
+    printf '未找到 accelerate 或 conda；请先激活 fastwam 环境后重试。\n' >&2
+    exit 127
+  fi
+  command=("$conda_exe" run --no-capture-output -n fastwam "${command[@]}")
+fi
 
 if [[ "${2:-}" == "--dry-run" ]]; then
   printf 'CUDA_VISIBLE_DEVICES=%q RUN_ID=%q ' "$CUDA_VISIBLE_DEVICES" "$RUN_ID"

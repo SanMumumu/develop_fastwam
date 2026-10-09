@@ -1,15 +1,18 @@
-"""RoutedWAM: a DreamFastWAM whose imagination is generated, routed and distilled.
+"""RoutedWAM: direct Dream regression with Video/Action-conditioned group routing.
 
-Three changes on top of :class:`DreamFastWAM`, each independently switchable so
-that ablations are config-only:
+The default Dream expert predicts future targets in one forward, without Dream
+noise or denoising. Action retains its flow-matching objective. The optional
+generative and distillation paths remain available for legacy experiments:
 
 ``generative``
     The Dream expert denoises its multi-modal future targets instead of
     regressing them (:mod:`generative_dream`).
 
 ``router``
-    A stable observation context generates 16 semantic feature gates once per
-    decision, shared across Action layers and denoising steps (:mod:`router`).
+    Per-layer sigmoid Dream group priors use Video + Action (VA), Dream + Action
+    (DA), or input-independent learned logits (S). The existing shared
+    mixed attention receives +log(gate) on Dream logits (:mod:`router`).
+    The earlier full/static/dynamic QK scaling experiments remain selectable.
 
 ``interface_distill``
     A one-step Dream pass is trained to reproduce the per-layer Dream K/V of an
@@ -59,7 +62,7 @@ def _is_new_parameter(key: str) -> bool:
 
 
 class RoutedWAM(DreamFastWAM):
-    """DreamFastWAM with a generative, routed and distillable imagination."""
+    """DreamFastWAM with routed imagination and optional legacy generation."""
 
     # ------------------------------------------------------------ construction
     @classmethod
@@ -117,6 +120,7 @@ class RoutedWAM(DreamFastWAM):
         model.routing_eval_gates = None
         model._routing_gradient_norms = {}
         model._training_progress_provider = None
+        model._routing_global_step = 0
         model._last_ema_step = -1
 
         # 1. Promote the Dream expert in place so the dense factory is reused.
@@ -133,6 +137,7 @@ class RoutedWAM(DreamFastWAM):
                 name: int(getattr(dream_expert, f"n_{name}")) for name in dream_expert.modalities
             },
             granularity=router_config.group_granularity,
+            camera_token_split=dream_expert.camera_token_split,
         )
         imagination_router = (
             ImaginationRouter(
@@ -142,6 +147,7 @@ class RoutedWAM(DreamFastWAM):
                 num_dream_tokens=int(dream_expert.num_dream_tokens),
                 group_ids=group_ids,
                 group_names=group_names,
+                future_offsets=list(dream_expert.future_offsets),
             )
             if router_config.enabled
             else None
@@ -239,6 +245,7 @@ class RoutedWAM(DreamFastWAM):
             raise ValueError("Training progress provider must return 2 or 3 values.")
         total_steps = max(int(total_steps), 0)
         global_step = max(int(global_step), 0)
+        self._routing_global_step = global_step
 
         feature_router = getattr(self.mot, "feature_router", None)
         if feature_router is not None:
@@ -681,7 +688,11 @@ class RoutedWAM(DreamFastWAM):
         if policy not in {"native", "zero", "calibrated_mean"}:
             raise ValueError("Unknown evaluation routing policy.")
         if self.mot.feature_router is None:
-            raise ValueError("Routing intervention requires a semantic Router.")
+            router = self.mot.router
+            if router is None or router.config.mode != "learned":
+                raise ValueError("Routing intervention requires a semantic Router.")
+            if policy != "native":
+                raise ValueError("zero/calibrated_mean interventions require the legacy signed QK Router.")
         if policy == "calibrated_mean":
             gates = torch.as_tensor(gates, dtype=torch.float32)
             if gates.shape != (16,) or not torch.isfinite(gates).all() or not ((gates >= -1) & (gates <= 1)).all():
@@ -768,7 +779,7 @@ class RoutedWAM(DreamFastWAM):
             from fastwam.utils.routing_experiment import paired_action_noise
             noise, timestep = paired_action_noise(action, sample["routing_sample_id"],
                 scheduler=self.train_action_scheduler, seed=int(sample["routing_noise_seed"][0])
-                + self.mot.feature_router.global_step * 10_007)
+                + self._routing_global_step * 10_007)
         else:
             noise = self._sample_action_noise(action, use_correlated_noise=self.use_correlated_noise_train)
             timestep = self.train_action_scheduler.sample_training_t(
@@ -801,7 +812,7 @@ class RoutedWAM(DreamFastWAM):
         """Flow-matching MSE per modality, masked exactly like the dense loss.
 
         The dense loss uses modality-specific objectives (BCE for the dynamic
-        mask, smooth-L1 for depth, cosine for DINO/SAM).  Those are objectives on
+        mask, SiLog for depth, cosine for DINO/SAM).  Those are objectives on
         the *value*; here the network regresses a velocity, for which a single
         squared error is the right and only consistent choice.
         """
@@ -849,7 +860,8 @@ class RoutedWAM(DreamFastWAM):
 
     def training_loss(self, sample, tiled: bool = False):
         self._refresh_progress()
-        if not self.dream_expert.generative_enabled and self.mot.feature_router is not None:
+        if (not self.dream_expert.generative_enabled
+                and (self.training_mode == "dense_joint" or self.mot.feature_router is not None)):
             return self._dense_training_loss(sample, tiled=tiled)
         if not self.uses_split_path:
             loss, metrics = super().training_loss(sample, tiled=tiled)
@@ -879,21 +891,42 @@ class RoutedWAM(DreamFastWAM):
         router = self.mot.router
         if router is None:
             return loss, metrics
-        gates = getattr(self.mot, "last_gates", [])
-        if router.config.mode == "learned" and router.config.lambda_budget > 0.0:
+        gates = self.mot.last_group_gates
+        if router.config.mode == "learned":
             if len(gates) != self.mot.num_layers:
                 raise RuntimeError(
-                    "Router budget loss requires gates from every Action layer; "
+                    "Learned routing requires group gates from every Action layer; "
                     f"collected {len(gates)} of {self.mot.num_layers}."
                 )
-        budget = router.budget_loss(gates)
-        if budget.requires_grad or float(budget.detach().item()) != 0.0:
-            loss = loss + budget
-        metrics["loss_router_budget"] = float(budget.detach().item())
-        metrics["router_budget_layers"] = len(gates)
+        # Gates are learned exclusively through Action loss. These are diagnostic
+        # metrics, with no budget, sparsity, entropy or gate-supervision objective.
+        metrics["router_layers"] = len(gates)
         metrics["router_strength"] = router.current_strength()
         metrics.update(router.scalar_metrics())
         return loss, metrics
+
+    @torch.no_grad()
+    def infer_action(self, *args, **kwargs):
+        """Export the final Action denoising forward, retaining every layer's gates.
+
+        group_gates is the layer mean for existing rollout consumers;
+        group_gates_per_layer is [B,L,Ng] for full trajectory/layer heatmaps.
+        """
+        self.mot._reset_router_records()
+        output = super().infer_action(*args, **kwargs)
+        router = self.mot.router
+        if router is not None and router.config.mode == "learned" and self.mot.last_group_gates:
+            per_layer = torch.stack(self.mot.last_group_gates, dim=1).detach().float().cpu()
+            groups = per_layer.mean(dim=1)
+            output.update(group_gates=groups, group_gates_per_layer=per_layer,
+                          group_mapping=router.group_mapping, gate_kind="attention_prior",
+                          gate_denoising_step="last", gate_layer_reduction="mean")
+            for modality, name in (("dino", "dino"), ("dyn", "tracker"),
+                                   ("sam", "sam"), ("depth", "depth")):
+                indices = [g["group_id"] for g in router.group_mapping if g["modality"] == modality]
+                if indices:
+                    output[f"{name}_activation"] = groups[:, indices].mean(dim=-1)
+        return output
 
     def _split_training_loss(self, sample, tiled: bool = False):
         """Train through the deployment computation: Video once, Dream, Action cached."""

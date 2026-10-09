@@ -1,8 +1,8 @@
 # @package _global_
 #
-# Stage 2: interface distillation on all four LIBERO suites.
+# Legacy generative experiment: interface distillation on all four LIBERO suites.
 # Same recipe as routed_wam_libero_goal_distill, with four-suite data.
-# Set resume to a stage-1 RoutedWAM weight checkpoint before launching.
+# Set resume to a generative stage-1 checkpoint before launching.
 
 defaults:
   - override /data: libero_dream_4suite_2cam
@@ -27,6 +27,9 @@ freeze_video_expert: true
 
 model:
   mot_checkpoint_mixed_attn: true
+  training_mode: joint
+  generative_dream:
+    enabled: true
   dream_scheduler:
     inference_steps: 1
   interface_distill:

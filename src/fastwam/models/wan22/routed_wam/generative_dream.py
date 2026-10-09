@@ -1,4 +1,7 @@
-"""Generative multi-modal Dream expert.
+"""Legacy, opt-in generative multi-modal Dream expert.
+
+The default RoutedWAM uses direct regression. Its Video/Action router does not
+require Dream noise or denoising; this module is enabled only by explicit config.
 
 The shipped :class:`DreamQueryExpert` is a *regressor*: a fixed set of learnable
 queries is decoded straight to the future depth / DINO / SAM / dynamics targets,
@@ -10,13 +13,8 @@ expert is conditioned on a Dream diffusion timestep, and the decoders now emit a
 flow-matching velocity instead of a point estimate. Each decoder also reads the
 unpooled noisy target at every output location, with timestep conditioning and a
 full-feature residual path; pooled Dream tokens alone cannot retain dense noise.
-Two things follow:
-
-* the action expert can be offered several denoising states of the future, which
-  is what makes an action-side router meaningful rather than a fixed re-weighting
-  of a single deterministic prediction;
-* there is a multi-step computation to compress, which is what interface
-  distillation compresses.
+This optional branch supplies a multi-step Dream computation that interface
+distillation can compress.
 
 Setting ``generative.enabled=false`` restores the parent behaviour exactly: no
 extra tensors are added to the forward and the extra parameters stay unused, so

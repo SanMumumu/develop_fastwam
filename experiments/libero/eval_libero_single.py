@@ -531,7 +531,9 @@ def _predict_action_chunk(
                       dream_predictions={k:v.detach().cpu() for k,v in pred.get("dream_predictions", {}).items()},
                       future_offsets=list(model.dream_expert.future_offsets), camera_token_split=pred.get("camera_token_split"),
                       routing={k:pred[k] for k in ("group_gates","group_mapping","dino_activation",
-                                                  "tracker_activation","sam_activation","depth_activation")})
+                                                  "tracker_activation","sam_activation","depth_activation",
+                                                  "group_gates_per_layer", "gate_kind", "gate_denoising_step",
+                                                  "gate_layer_reduction") if k in pred})
         record["routing"] = {k:v.detach().cpu() if torch.is_tensor(v) else v for k,v in record["routing"].items()}
         decision_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(record, decision_path)

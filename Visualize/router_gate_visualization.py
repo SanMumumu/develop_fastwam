@@ -29,8 +29,9 @@ def pool_group_gates(routing: dict) -> np.ndarray:
         gates = gates[0]
     if gates.shape != (16,) or not np.isfinite(gates).all():
         raise ValueError("A replan record must contain 16 finite gates for one episode.")
-    if (gates < -1).any() or (gates > 1).any():
-        raise ValueError("Gate values must be in [-1,1].")
+    lower = 0 if routing.get("gate_kind") == "attention_prior" else -1
+    if (gates < lower).any() or (gates > 1).any():
+        raise ValueError(f"Gate values must be in [{lower},1].")
     mapping = routing["group_mapping"]
     if len(mapping) != 16 or sorted(g["group_id"] for g in mapping) != list(range(16)):
         raise ValueError("Expected a one-to-one mapping for all 16 groups.")
@@ -51,11 +52,16 @@ def load_replan_summaries(raw_dir: str | Path) -> list[dict]:
     summaries = []
     last_step = -1
     expected_mapping = None
+    expected_kind = None
     for path in paths:
         record = torch.load(path, map_location="cpu", weights_only=False)
         if "routing" not in record:
             raise ValueError(f"{path.name} has no recorded semantic gates. Do not substitute fabricated values.")
         routing = record["routing"]
+        kind = routing.get("gate_kind", "qk_scale")
+        if expected_kind is not None and expected_kind != kind:
+            raise ValueError("Gate semantics changed within this episode.")
+        expected_kind = kind
         activations = pool_group_gates(routing)
         mapping = sorted(routing['group_mapping'], key=lambda group: group['group_id'])
         if expected_mapping is not None and mapping != expected_mapping:
@@ -69,6 +75,8 @@ def load_replan_summaries(raw_dir: str | Path) -> list[dict]:
         last_step = step
         summaries.append(dict(rgb=record['rgb'], activations=activations,
                               env_step=step, replan_index=index))
+        if kind == "attention_prior":
+            summaries[-1]["gate_kind"] = kind
         del record  # dense Dream targets are deliberately not retained
     return summaries
 
@@ -93,7 +101,8 @@ def _fit_rgb(rgb, width, height):
 
 
 def render_column(summary, *, camera="image", column_width=320, image_height=224):
-    """Signed QK scales: zero-centered bars, negative left and positive right."""
+    """Draw sigmoid priors in [0,1], or legacy signed QK scales in [-1,1]."""
+    prior = summary.get("gate_kind") == "attention_prior"
     if camera not in ("image", "wrist_image", "both"):
         raise ValueError("camera must be image, wrist_image or both.")
     if column_width < 240 or image_height < 96:
@@ -111,15 +120,17 @@ def render_column(summary, *, camera="image", column_width=320, image_height=224
         observation = _fit_rgb(rgb[camera], column_width, image_height)
     canvas[header:header+image_height] = observation
     y0 = header + image_height
-    _text(canvas, "DREAM QK SCALE   pooled views / horizons", (12, y0 + 22), scale=0.36)
+    title = ("DREAM PRIOR   pooled layers / views / horizons" if prior else
+             "DREAM QK SCALE   pooled views / horizons")
+    _text(canvas, title, (12, y0 + 22), scale=0.32 if prior else 0.36)
     for i, (label, color, value) in enumerate(zip(LABELS, COLORS, summary['activations'])):
         y = y0 + separator + i * row_height
         _text(canvas, label, (14, y + 15), color=color)
         _text(canvas, f"{value:+.3f}", (column_width - 70, y + 15), color=(238, 243, 250))
         x1, x2 = 14, column_width - 14
         cv2.rectangle(canvas, (x1, y + 24), (x2, y + 32), (25, 33, 48), -1)
-        center = (x1 + x2) // 2
-        length = int(round(abs(float(value)) * (x2 - x1) / 2))
+        center = x1 if prior else (x1 + x2) // 2
+        length = int(round(abs(float(value)) * (x2 - x1) / (1 if prior else 2)))
         if length:
             glow = np.zeros_like(canvas)
             intensity = tuple(int(c * abs(float(value))) for c in color)
@@ -131,7 +142,8 @@ def render_column(summary, *, camera="image", column_width=320, image_height=224
                              0, 255).astype(np.uint8)
             cv2.rectangle(canvas, (left, y + 24), (right, y + 32), intensity, -1)
         cv2.line(canvas, (center, y + 22), (center, y + 34), (130, 144, 165), 1)
-    _text(canvas, "-1                             0                             +1",
+    _text(canvas, ("0                                                              1" if prior else
+                   "-1                             0                             +1"),
           (14, height - 8), scale=0.30, color=(130, 144, 165))
     return canvas
 
@@ -188,7 +200,9 @@ def render_gate_episode(raw_dir, output_dir, *, camera="image", column_width=320
     np.save(output_dir / 'replan_modality_history.npy', activations)
     result = dict(timeline=str(timeline), pages=str(pages_dir), frames=str(frames_dir),
                   video=str(video_path) if save_video else None, num_replans=len(summaries),
-                  camera=camera, modality_order=list(LABELS), scale=[-1, 1], fps=float(fps),
+                  camera=camera, modality_order=list(LABELS),
+                  scale=[0, 1] if summaries[0].get('gate_kind') == 'attention_prior' else [-1, 1],
+                  fps=float(fps),
                   playback='one frame per replan; not simulator realtime',
                   replans=[dict(replan_index=s['replan_index'], env_step=s['env_step'],
                                 activations=s['activations'].tolist()) for s in summaries])

@@ -1,0 +1,17 @@
+# @package _global_
+# S / VA / DA share the Dream ablation "all" recipe. Reuse that run as D.
+defaults:
+  - dream_ablation_libero_10
+  - _self_
+
+output_dir: ./runs/routed_ablation_libero_10/${model.router.gate_type}_seed${seed}
+wandb:
+  project: RoutedWAM
+  group: libero_10_routing_seed${seed}
+
+model:
+  router:
+    mode: learned
+    routing_mode: null
+    gate_type: va  # Override with model.router.gate_type=static or da.
+    hard_prune_at_inference: false

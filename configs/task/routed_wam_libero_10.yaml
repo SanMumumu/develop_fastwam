@@ -1,7 +1,7 @@
 # @package _global_
 #
-# RoutedWAM stage 1 on LIBERO-10. Four GPUs give an effective batch of
-# 16 per GPU * 4 GPUs * 4 accumulation steps = 256.
+# RoutedWAM with regression Dream on LIBERO-10. Four GPUs give an effective batch of
+# 32 per GPU * 4 GPUs * 1 accumulation step = 128.
 # The data config supplies 32 actions and Dream targets at offsets [16, 32].
 
 defaults:
@@ -22,20 +22,20 @@ save_every: 2000
 eval_every: 0
 gradient_accumulation_steps: 1
 weight_decay: 1e-2
-resume: null
+resume: ./checkpoints/libero_uncond_2cam224_100m.pt
 freeze_video_expert: true
 
 model:
   mot_checkpoint_mixed_attn: true
-  # Joint Dream + Action training with dynamic semantic feature routing.
+  # Freeze pretrained Video; jointly train Dream, Action and the group Router.
+  training_mode: dense_joint
+  finetune_action_only: false
+  generative_dream:
+    enabled: false
   router:
-    mode: none
-    routing_mode: dynamic
-    router_enabled: true
-    router_warmup_steps: 200
-  dream_scheduler:
-    # Inference only; stage 1 is not a distilled one-step model.
-    inference_steps: 8
+    mode: learned
+    routing_mode: null
+    lambda_budget: 0.0
   interface_distill:
     enabled: false
   loss:

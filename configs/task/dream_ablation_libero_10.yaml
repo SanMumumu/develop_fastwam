@@ -5,11 +5,11 @@ defaults:
 
 output_dir: ./runs/dream_ablation_libero_10/all_seed42
 seed: 42
-max_steps: 5000
+max_steps: 4000
 batch_size: 32
 gradient_accumulation_steps: 2
 expected_global_batch_size: 256
-save_every: 2000
+save_every: 1500
 log_every: 10
 eval_every: 0
 reset_router_on_weight_load: false
