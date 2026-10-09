@@ -59,6 +59,11 @@ class RoutedMoT(MoT):
         self.capture_kv = False
         self.captured_kv: list[dict[str, torch.Tensor]] = []
         self.last_gates: list[torch.Tensor] = []
+        # Analysis-only, default off: records where the action queries actually
+        # spend their attention, which is the one quantity the router's own
+        # statistics cannot report (a kept token may still be ignored).
+        self.capture_action_attention = False
+        self.captured_action_attention: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------ utils
     @property
@@ -182,6 +187,22 @@ class RoutedMoT(MoT):
             raise FloatingPointError("Routed action attention probabilities contain NaN/Inf.")
         out = torch.matmul(probs.to(dtype=v.dtype), v)
         out = out.transpose(1, 2).reshape(batch_size, action_len, inner_dim)
+        if self.capture_action_attention:
+            with torch.no_grad():
+                head_mean = probs.float().mean(dim=1)  # [B, Sa, S]
+                self.captured_action_attention.append(
+                    {
+                        "layer": int(layer_idx),
+                        # [B, Sd]: attention each dream key receives, averaged
+                        # over heads and summed over the action chunk's queries.
+                        "dream_probs": head_mean[..., dream_slice].mean(dim=1).cpu(),
+                        "mass_video": head_mean[..., : dream_slice.start].sum(dim=-1).mean(dim=1).cpu(),
+                        "mass_dream": head_mean[..., dream_slice].sum(dim=-1).mean(dim=1).cpu(),
+                        "mass_action": head_mean[..., action_slice].sum(dim=-1).mean(dim=1).cpu(),
+                        "gate": gate_info["gate"].float().cpu(),
+                        "keep": gate_info["keep"].cpu(),
+                    }
+                )
         return out, gate_info
 
     # ---------------------------------------------------------------- forward
@@ -196,6 +217,9 @@ class RoutedMoT(MoT):
         attention_layers: Optional[list[int]] = None,
         return_router_statistics: bool = False,
     ):
+        # Reset before the early return too: a stale gate list from a previous
+        # forward must never reach `budget_loss`.
+        self.last_gates = []
         if not self.routing_enabled and not self.capture_kv:
             return super().forward(
                 embeds_all=embeds_all,
@@ -386,6 +410,12 @@ class RoutedMoT(MoT):
             dream_slice=context_slices["dream"],
             layer_idx=layer_idx,
         )
+        # The split training path (Video-once / Dream / Action-cached) runs
+        # through here, not through `forward`. Collecting the gate is what makes
+        # `ImaginationRouter.budget_loss` see anything: without it the budget
+        # term silently evaluates to zero, the router gets no pruning pressure,
+        # and the gate stays pinned at its `sigmoid(bias_init)` initialisation.
+        self.last_gates.append(gate_info["gate"])
         if self.router is not None:
             self.router.record(
                 layer_idx=layer_idx,
@@ -396,6 +426,9 @@ class RoutedMoT(MoT):
         return out
 
     def forward_action_with_context_cache(self, *args, **kwargs) -> torch.Tensor:
+        # Both the statistics and the collected gates belong to one forward;
+        # stale gates from a previous call would corrupt the budget loss.
+        self.last_gates = []
         if self.router is not None:
             self.router.reset_statistics()
         return super().forward_action_with_context_cache(*args, **kwargs)

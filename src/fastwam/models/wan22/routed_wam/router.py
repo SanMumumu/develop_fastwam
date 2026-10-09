@@ -50,6 +50,17 @@ logger = get_logger(__name__)
 
 ROUTER_MODES = ("none", "threshold", "learned")
 
+#: How Dream tokens are bucketed for the budget bias, logging and analysis.
+#: The `_camera` variants split each block into its primary and wrist halves,
+#: which is what the stage-dependent-perception study needs.
+GROUP_GRANULARITIES = (
+    "none",
+    "modality",
+    "modality_horizon",
+    "modality_camera",
+    "modality_horizon_camera",
+)
+
 
 @dataclass(frozen=True)
 class RouterConfig:
@@ -95,10 +106,10 @@ class RouterConfig:
             raise ValueError(f"router.warmup_ratio must be in [0,1], got {cfg.warmup_ratio}.")
         if cfg.min_keep_tokens < 0:
             raise ValueError(f"router.min_keep_tokens must be >= 0, got {cfg.min_keep_tokens}.")
-        if cfg.group_granularity not in ("none", "modality", "modality_horizon"):
+        if cfg.group_granularity not in GROUP_GRANULARITIES:
             raise ValueError(
                 "router.group_granularity must be one of "
-                f"('none', 'modality', 'modality_horizon'), got {cfg.group_granularity!r}."
+                f"{GROUP_GRANULARITIES}, got {cfg.group_granularity!r}."
             )
         if cfg.debug_force_gate is not None and not 0.0 <= float(cfg.debug_force_gate) <= 1.0:
             raise ValueError("router.debug_force_gate must be in [0,1] when set.")
@@ -115,39 +126,81 @@ def build_group_ids(
     num_future_offsets: int,
     tokens_per_modality: dict[str, int],
     granularity: str,
+    camera_token_split: Optional[tuple[int, int]] = None,
 ) -> tuple[torch.Tensor, list[str]]:
     """Map each Dream token to an interpretable group id.
 
-    Dream tokens are laid out modality-major and, within a modality, offset-major
-    (see ``DreamQueryExpert.pre_dit``), so the grouping is a pure function of the
-    layout and needs no runtime information.
+    Dream tokens are laid out modality-major, then offset-major, and within one
+    (modality, offset) block the first ``camera_token_split[0]`` tokens belong to
+    the primary camera and the rest to the wrist camera -- the same convention
+    ``DenseDreamDecoder.forward_two_view`` decodes with. The grouping is
+    therefore a pure function of the layout and needs no runtime information.
+
+    The camera granularities exist for the stage-dependent-perception analysis:
+    the hypothesis that a policy leans on global semantics (DINO/SAM, primary
+    view) early in an episode and on local geometry (depth, wrist view) near
+    contact is only testable if the wrist tokens are a separate group.
 
     Returns:
         ids: LongTensor [num_dream_tokens] of group indices.
         names: human-readable name per group index, used for logging and figures.
     """
-    if granularity == "none":
-        names = ["all"]
-    elif granularity == "modality":
-        names = list(modalities)
-    else:
-        names = [
-            f"{modality}@t{offset_index}"
-            for modality in modalities
-            for offset_index in range(num_future_offsets)
-        ]
+    if granularity not in GROUP_GRANULARITIES:
+        raise ValueError(
+            f"granularity must be one of {GROUP_GRANULARITIES}, got {granularity!r}."
+        )
+    with_camera = granularity.endswith("_camera")
+    with_horizon = "horizon" in granularity
+    if with_camera and camera_token_split is None:
+        raise ValueError(
+            f"granularity={granularity!r} needs dream_query.camera_token_split; "
+            "without it the primary and wrist tokens are indistinguishable."
+        )
+
+    cameras = ["primary", "wrist"] if with_camera else [None]
+
+    def group_name(modality: str, offset_index: int, camera: Optional[str]) -> str:
+        if granularity == "none":
+            return "all"
+        name = modality
+        if with_horizon:
+            name = f"{name}@t{offset_index}"
+        if camera is not None:
+            name = f"{name}/{camera}"
+        return name
+
+    names: list[str] = []
+    index_by_name: dict[str, int] = {}
+    for modality in modalities:
+        for offset_index in range(num_future_offsets if with_horizon else 1):
+            for camera in cameras:
+                name = group_name(modality, offset_index, camera)
+                if name not in index_by_name:
+                    index_by_name[name] = len(names)
+                    names.append(name)
 
     ids: list[int] = []
-    for modality_index, modality in enumerate(modalities):
+    for modality in modalities:
         per_offset = int(tokens_per_modality[modality])
+        if with_camera:
+            primary_tokens, wrist_tokens = camera_token_split
+            if primary_tokens + wrist_tokens != per_offset:
+                raise ValueError(
+                    f"camera_token_split {list(camera_token_split)} must sum to "
+                    f"n_{modality}={per_offset}."
+                )
         for offset_index in range(num_future_offsets):
-            if granularity == "none":
-                group_index = 0
-            elif granularity == "modality":
-                group_index = modality_index
+            horizon_index = offset_index if with_horizon else 0
+            if with_camera:
+                primary_tokens, wrist_tokens = camera_token_split
+                ids.extend(
+                    [index_by_name[group_name(modality, horizon_index, "primary")]] * primary_tokens
+                )
+                ids.extend(
+                    [index_by_name[group_name(modality, horizon_index, "wrist")]] * wrist_tokens
+                )
             else:
-                group_index = modality_index * num_future_offsets + offset_index
-            ids.extend([group_index] * per_offset)
+                ids.extend([index_by_name[group_name(modality, horizon_index, None)]] * per_offset)
     return torch.tensor(ids, dtype=torch.long), names
 
 
