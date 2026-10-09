@@ -35,11 +35,17 @@ class DenseDreamDecoder(nn.Module):
         attn_head_dim: int | None = None,
         enabled: bool = True,
         type: str | None = None,
+        camera_layout: str = "horizontal",
     ):
         super().__init__()
         self.modality = modality
         self.enabled = bool(enabled)
         self.type = type
+        if camera_layout not in {"horizontal", "camera_major"}:
+            raise ValueError("camera_layout must be horizontal or camera_major.")
+        if camera_layout == "camera_major" and target_layout != "token_feature":
+            raise ValueError("camera_major only applies to token_feature outputs.")
+        self.camera_layout = camera_layout
         self.target_layout = str(target_layout)
         self.patch_size = None if patch_size is None else int(patch_size)
         self.decoder_dim = int(decoder_dim)
@@ -130,7 +136,9 @@ class DenseDreamDecoder(nn.Module):
         self.decoder = nn.TransformerDecoder(layer, num_layers=self.num_layers)
         self.output_proj = nn.Linear(self.decoder_dim, self.feature_dim)
 
-    def forward(self, latent_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, latent_tokens: torch.Tensor, query_condition: torch.Tensor | None = None
+    ) -> torch.Tensor:
         if not self.enabled:
             raise RuntimeError(f"Decoder for modality={self.modality!r} is disabled.")
         if latent_tokens.ndim != 3:
@@ -141,6 +149,10 @@ class DenseDreamDecoder(nn.Module):
         queries = self.output_queries.to(device=latent_tokens.device, dtype=memory.dtype).expand(
             latent_tokens.shape[0], -1, -1
         )
+        if query_condition is not None:
+            if query_condition.shape != queries.shape:
+                raise ValueError(f"{self.modality} query condition must match {tuple(queries.shape)}.")
+            queries = queries + query_condition.to(device=queries.device, dtype=queries.dtype)
         decoded = self.decoder(tgt=queries, memory=memory)
         out = self.output_proj(decoded)
         if self.target_layout == "grid_feature":
@@ -167,12 +179,17 @@ class DenseDreamDecoder(nn.Module):
             .permute(0, 1, 3, 2, 4)
             .reshape(patches.shape[0], *self.target_shape)
         )
-        if self.modality == "depth":
+        if self.modality == "depth" and getattr(self, "nonnegative_depth_output", True):
             image = F.relu(image)
         return image.contiguous()
 
     def _two_view_query_indices(self, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Return output-query indices for the left (primary) and right (wrist) views."""
+        if self.camera_layout == "camera_major":
+            if self.num_output_tokens % 2:
+                raise ValueError("camera_major requires two equal camera token counts.")
+            indices = torch.arange(self.num_output_tokens, device=device)
+            return indices.chunk(2)
         if self.target_layout in {"grid_feature", "image"}:
             grid_h, combined_grid_w = self.output_grid_shape
             if combined_grid_w % 2 != 0:
@@ -210,18 +227,23 @@ class DenseDreamDecoder(nn.Module):
         self,
         latent_tokens: torch.Tensor,
         query_indices: torch.Tensor,
+        query_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
         memory = self.latent_proj(latent_tokens)
         queries = self.output_queries.index_select(1, query_indices).to(
             device=latent_tokens.device, dtype=memory.dtype
         )
         queries = queries.expand(latent_tokens.shape[0], -1, -1)
+        if query_condition is not None:
+            condition = query_condition.index_select(1, query_indices)
+            queries = queries + condition.to(device=queries.device, dtype=queries.dtype)
         return self.output_proj(self.decoder(tgt=queries, memory=memory))
 
     def forward_two_view(
         self,
         primary_latent_tokens: torch.Tensor,
         wrist_latent_tokens: torch.Tensor,
+        query_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode each camera only from its assigned Dream latent tokens."""
         if not self.enabled:
@@ -242,8 +264,15 @@ class DenseDreamDecoder(nn.Module):
         primary_indices, wrist_indices = self._two_view_query_indices(
             device=primary_latent_tokens.device
         )
-        primary_out = self._decode_with_queries(primary_latent_tokens, primary_indices)
-        wrist_out = self._decode_with_queries(wrist_latent_tokens, wrist_indices)
+        if query_condition is not None:
+            expected = (primary_latent_tokens.shape[0], self.num_output_tokens, self.decoder_dim)
+            if tuple(query_condition.shape) != expected:
+                raise ValueError(f"{self.modality} query condition must match {expected}.")
+        primary_out = self._decode_with_queries(primary_latent_tokens, primary_indices, query_condition)
+        wrist_out = self._decode_with_queries(wrist_latent_tokens, wrist_indices, query_condition)
+
+        if self.camera_layout == "camera_major":
+            return torch.cat([primary_out, wrist_out], dim=1)
 
         if self.target_layout == "grid_feature":
             grid_h, combined_grid_w = self.output_grid_shape
@@ -497,6 +526,7 @@ class DreamQueryExpert(nn.Module):
                 attn_head_dim=decoder_attn_head_dim,
                 enabled=enabled,
                 type=cfg.get("type"),
+                camera_layout=cfg.get("camera_layout", "horizontal"),
             )
 
         self.architecture = self._resolved_architecture()
@@ -548,6 +578,7 @@ class DreamQueryExpert(nn.Module):
                         "target_layout": getattr(decoder, "target_layout", None),
                         "target_shape": list(decoder.target_shape) if getattr(decoder, "target_shape", None) is not None else None,
                         "patch_size": getattr(decoder, "patch_size", None),
+                        "camera_layout": decoder.camera_layout,
                     }
                     for name, decoder in self.decoders.items()
                 },
@@ -642,13 +673,15 @@ class DreamQueryExpert(nn.Module):
             flat_tokens = modality_tokens.reshape(
                 bsz * self.num_future_offsets, per_offset_tokens, dim
             )
+            query_condition = pre_state.get("decoder_query_conditions", {}).get(name)
             if self.camera_token_split is None:
-                decoded = decoder(flat_tokens)
+                decoded = decoder(flat_tokens, query_condition=query_condition)
             else:
                 primary_tokens, wrist_tokens = self.camera_token_split
                 decoded = decoder.forward_two_view(
                     flat_tokens[:, :primary_tokens, :],
                     flat_tokens[:, primary_tokens : primary_tokens + wrist_tokens, :],
+                    query_condition=query_condition,
                 )
             out[name] = decoded.reshape(bsz, self.num_future_offsets, *decoded.shape[1:])
         return out

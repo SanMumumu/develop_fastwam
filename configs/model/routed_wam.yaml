@@ -39,8 +39,7 @@ generative_dream:
   # starves the branch of its own input.
   target_encoder_init_scale: 1.0
 
-# Flow-matching schedule for the Dream branch. `inference_steps: 1` is the
-# deployed setting; interface distillation is what makes one step sufficient.
+# Used only when generative_dream.enabled=true; unused by direct regression.
 dream_scheduler:
   train_shift: 5.0
   infer_shift: 5.0
@@ -48,16 +47,15 @@ dream_scheduler:
   inference_steps: 1
 
 # ------------------------------------------------------------------- router
-# Which imagined tokens the action expert is allowed to read.
-#   none      -- dense, every dream token is read (upper bound / control)
-#   threshold -- parameter-free attention-mass policy (training-free baseline)
-#   learned   -- low-rank bilinear gate, trained with a budget penalty
+# Learned priors: va = Video + Action, da = Dream + Action, static = learned constants.
+# The existing shared mixed softmax receives +log(gate) on Dream columns only.
 router:
   mode: learned
+  routing_mode: null
+  gate_type: va              # va | da | static; mode=none disables these priors.
+  group_granularity: modality_horizon_view
   rank: 64
   temperature: 1.0
-  # sigmoid(4) ~ 0.982, so routing starts as a near-identity and has to learn
-  # what to switch off rather than what to switch on.
   bias_init: 4.0
   # Buckets used for the budget bias, the training-log breakdown and the
   # stage-dependent-perception figure. `_camera` splits each block into its
@@ -72,10 +70,13 @@ router:
   lambda_budget: 0.01
   gate_threshold: 1.0e-3
   hard_prune_at_inference: true
-  warmup_ratio: 0.1
+  min_keep_tokens: 0
   log_statistics: true
-  debug_force_gate: null
-  layers: null
+  # Compatibility settings for explicitly selected full/static/dynamic QK tasks.
+  router_enabled: true
+  router_warmup_steps: 0
+  router_hidden_dim: 128
+  router_gate_loss_weight: 0.0  # Router learns from Action loss without an information cost.
 
 # -------------------------------------------------------- interface distill
 # Compress the multi-step Dream rollout into one forward, supervising the
@@ -116,3 +117,4 @@ online_dream_targets:
   video_range: tanh
 
 finetune_action_only: false
+training_mode: dense_joint

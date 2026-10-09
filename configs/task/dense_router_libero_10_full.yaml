@@ -1,0 +1,81 @@
+# @package _global_
+defaults:
+  - override /data: libero_10_2cam
+  - override /model: routed_wam
+  - _self_
+
+output_dir: ./runs/dense_router_libero_10/full
+seed: 42
+batch_size: 32
+gradient_accumulation_steps: 2  # four cards; launcher uses 1 for eight cards
+expected_global_batch_size: 256
+num_workers: 4
+learning_rate: 1.0e-4
+lr_scheduler_type: cosine
+weight_decay: 1.0e-2
+max_grad_norm: 1.0
+mixed_precision: bf16
+num_epochs: 100  # max_steps is the budget, not epochs
+max_steps: 1600
+log_every: 1
+save_every: 0  # final weights/state only; no checkpoint selection
+eval_every: 0  # fixed offline protocol instead of random Trainer video eval
+freeze_video_expert: true
+resume: ./checkpoints/libero_uncond_2cam224_100m.pt
+reset_router_on_weight_load: false
+experiment:
+  training_mode: dense_joint
+  split_manifest: ./RoutedWAM_EXP/artifacts/episode_split.json
+  baseline_dir: ./runs/dense_router_libero_10/full
+  checkpoint_origin: "User-provided FastWAM checkpoint; original training data not independently verified"
+wandb:
+  enabled: false
+
+data:
+  train:
+    episode_manifest: ${experiment.split_manifest}
+    routing_noise_seed: ${seed}
+    val_set_proportion: 0.1
+    dream_target:
+      max_resample_retry: 0
+    max_padding_retry: 0
+    skip_padding_as_possible: false
+  val:
+    _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+    dataset_name: ${data.train.dataset_name}
+    dataset_dirs: ${data.train.dataset_dirs}
+    shape_meta: ${data.train.shape_meta}
+    num_frames: ${data.train.num_frames}
+    action_video_freq_ratio: ${data.train.action_video_freq_ratio}
+    video_size: ${data.train.video_size}
+    processor: ${data.train.processor}
+    text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
+    context_len: ${data.train.context_len}
+    dream_target: ${data.train.dream_target}
+    episode_manifest: ${experiment.split_manifest}
+    routing_noise_seed: ${seed}
+    is_training_set: false
+    val_set_proportion: 0.1
+    max_padding_retry: 0
+    skip_padding_as_possible: false
+
+model:
+  training_mode: ${experiment.training_mode}
+  generative_dream:
+    enabled: false
+  interface_distill:
+    enabled: false
+  router:
+    mode: none
+    routing_mode: full
+    router_hidden_dim: 128
+    router_warmup_steps: 0
+    router_gate_loss_weight: 0.0
+  dream_query_config:
+    dream_decoder:
+      dyn:
+        camera_layout: camera_major
+  loss:
+    lambda_video: 0.0
+    lambda_action: 1.0
+    lambda_dream: 0.1

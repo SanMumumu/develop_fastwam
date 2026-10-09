@@ -671,6 +671,8 @@ class MoT(nn.Module):
                 action_slice=action_slice,
                 context_slices=context_slices,
                 layer_idx=layer_idx,
+                **({"dream_token_gates": layer_cache["dream_token_gates"]}
+                   if "dream_token_gates" in layer_cache else {}),
             )
             x = self._apply_post_with_optional_checkpoint(
                 block=block,

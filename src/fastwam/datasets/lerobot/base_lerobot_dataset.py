@@ -61,6 +61,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         # sampling
         global_sample_stride: int = 1,
+        episode_manifest: Optional[str] = None,
+        strict_loading: bool = False,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -68,6 +70,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         assert action_size == obs_size - 1, "In this dataset, action_size should be obs_size - 1"
         
         self.dataset_dirs = resolve_lerobot_dataset_dirs(dataset_dirs)
+        self.strict_loading = strict_loading
         self.shape_meta = shape_meta
         self.action_size = action_size
         self.past_action_size = past_action_size
@@ -114,7 +117,12 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
 
         episodes = {}
-        if val_set_proportion < 1e-6:
+        if episode_manifest is not None:
+            if len(metas) != 1:
+                raise ValueError("An episode manifest currently describes exactly one dataset.")
+            from fastwam.utils.routing_experiment import load_split
+            episodes[metas[0].repo_id] = load_split(episode_manifest, self.dataset_dirs[0], is_training_set)
+        elif val_set_proportion < 1e-6:
             for meta in metas:
                 episodes.update({meta.repo_id: list(range(meta.total_episodes))})
         else:
@@ -249,6 +257,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 lerobot_sample = self._split_lerobot_sample(lerobot_sample)
                 break
             except Exception as err:
+                if self.strict_loading:
+                    raise
                 attempt += 1
                 last_exception = err
                 logger.warning(

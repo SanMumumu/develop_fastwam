@@ -37,6 +37,11 @@ from experiments.libero.libero_utils import (
 )
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from fastwam.models.wan22.routed_wam.gate_history import GateHistory
+from fastwam.utils.routing_evaluation import (
+    apply_routing_policy, evaluation_identity, initial_state_ids, resume_episode, rollout_seed,
+)
+from fastwam.utils.routing_experiment import atomic_json
 from fastwam.utils.pytorch_utils import set_global_seed
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from libero.libero import benchmark
@@ -449,6 +454,9 @@ def _predict_action_chunk(
     input_h: int,
     model_device: str,
     noise_seed: Optional[int] = None,
+    gate_history=None,
+    decision_path=None,
+    decision_metadata=None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
@@ -487,6 +495,9 @@ def _predict_action_chunk(
     }
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
+    capture_dream = decision_path is not None and decision_metadata["replan_index"] in cfg.routing_eval.get("dream_capture_replans", [0, 5, 15, 30, 50])
+    if capture_dream:
+        infer_kwargs["return_dream_predictions"] = True
     if visualize_future_video:
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
     elif "num_video_frames" in inspect.signature(model.infer_action).parameters:
@@ -499,6 +510,8 @@ def _predict_action_chunk(
         else:
             pred = model.infer_action(**infer_kwargs)
     action = pred["action"]  # [T, D]
+    if gate_history is not None:
+        gate_history.begin_decision(pred)
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
 
@@ -508,6 +521,22 @@ def _predict_action_chunk(
     action = invert_gripper_action(action)
     if bool(cfg.EVALUATION.get("binarize_gripper", False)):
         action[..., -1] = np.sign(action[..., -1])
+    if decision_path is not None:
+        record = dict(metadata={**decision_metadata, "noise_seed": noise_seed,
+                      "dream_prediction_mode": "flow_matching" if getattr(model.dream_expert, "generative_enabled", False) else "regression",
+                      "dyn_camera_layout": getattr(model.dream_expert.decoders["dyn"], "camera_layout", "horizontal")},
+                      rgb=imgs, proprio=proprio.detach().cpu().float(),
+                      normalized_action=pred["action"].detach().cpu().float(),
+                      executed_action=torch.as_tensor(action),
+                      dream_predictions={k:v.detach().cpu() for k,v in pred.get("dream_predictions", {}).items()},
+                      future_offsets=list(model.dream_expert.future_offsets), camera_token_split=pred.get("camera_token_split"),
+                      routing={k:pred[k] for k in ("group_gates","group_mapping","dino_activation",
+                                                  "tracker_activation","sam_activation","depth_activation",
+                                                  "group_gates_per_layer", "gate_kind", "gate_denoising_step",
+                                                  "gate_layer_reduction") if k in pred})
+        record["routing"] = {k:v.detach().cpu() if torch.is_tensor(v) else v for k,v in record["routing"].items()}
+        decision_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(record, decision_path)
     return action, imgs, predicted_future_frames
 
 
@@ -537,14 +566,18 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
+    gate_history=None,
+    record_directory=None,
 ) -> tuple[bool, list, list[dict[str, Any]], Optional[float]]:
-    max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
+    max_steps = int(cfg.routing_eval.get("max_steps", 700)) if cfg.get("routing_eval") is not None else _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     use_action_ensembler = bool(cfg.EVALUATION.get("use_action_ensembler", False))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
 
+    if cfg.get("routing_eval") is not None:
+        env.seed(rollout_seed(cfg.seed, cfg.EVALUATION.task_id, episode_idx))
     env.reset()
     obs = env.set_init_state(initial_state)
     if use_action_ensembler:
@@ -582,6 +615,8 @@ def run_single_episode(
                 if base_seed is None
                 else base_seed + episode_idx * 10_000 + replan_counter
             )
+            if cfg.get("routing_eval") is not None:
+                noise_seed = rollout_seed(cfg.seed, cfg.EVALUATION.task_id, episode_idx, replan_counter)
             replan_counter += 1
             action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
                 obs=obs,
@@ -594,6 +629,11 @@ def run_single_episode(
                 input_h=input_h,
                 model_device=model_device,
                 noise_seed=noise_seed,
+                gate_history=gate_history,
+                decision_path=None if record_directory is None else record_directory / "raw_predictions" / f"replan_{replan_counter-1:04d}.pt",
+                decision_metadata=dict(replan_index=replan_counter-1, env_step=t,
+                    task_id=int(cfg.EVALUATION.task_id), initial_state_index=episode_idx,
+                    task_suite_name=str(cfg.EVALUATION.task_suite_name), task_description=task_description),
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1
@@ -618,6 +658,8 @@ def run_single_episode(
             replay_images.append(imgs.copy())
 
         obs, _, done, _ = env.step(pending_actions.pop(0))
+        if gate_history is not None:
+            gate_history.append_step(t)
         if visualize_future_video and current_predicted_future_clip is not None:
             current_replan_step += 1
             if current_replan_step in capture_steps:
@@ -692,6 +734,7 @@ def run_single_task(
     input_w: int,
     input_h: int,
     model_device: str,
+    protocol_identity=None,
 ) -> dict:
     env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
@@ -705,7 +748,28 @@ def run_single_task(
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None
 
-    for trial_idx in range(int(cfg.EVALUATION.num_trials)):
+    ids = initial_state_ids(cfg, len(initial_states))
+    results["initial_state_ids"] = ids
+    results["episodes"] = []
+    for trial_idx in ids:
+        record_directory = None
+        if protocol_identity is not None and trial_idx in cfg.routing_eval.get("visualization_ids", []):
+            root = cfg.routing_eval.get("visualization_root")
+            if root:
+                record_directory = Path(root) / f"task{cfg.EVALUATION.task_id}_init{trial_idx}"
+        episode_path = video_dir.parent / "episodes" / f"task{cfg.EVALUATION.task_id}_init{trial_idx}.json"
+        saved = None if protocol_identity is None else resume_episode(
+            episode_path, protocol_identity, int(cfg.EVALUATION.task_id), trial_idx,
+            resume=bool(cfg.routing_eval.get("resume", True)))
+        if saved is not None:
+            success = saved["success"]
+            results["successes"] += int(success)
+            results["success_episodes" if success else "failure_episodes"].append(trial_idx)
+            results["episodes"].append(saved)
+            continue
+        if record_directory is not None and record_directory.exists():
+            record_directory.rename(record_directory.with_name(record_directory.name + f"_incomplete_{time.time_ns()}"))
+        gate_history = GateHistory()
         success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
@@ -718,7 +782,10 @@ def run_single_task(
             input_w=input_w,
             input_h=input_h,
             model_device=model_device,
+            gate_history=gate_history,
+            record_directory=record_directory,
         )
+        gate_history.save(video_dir / f"gates_task{cfg.EVALUATION.task_id}_trial{trial_idx}")
         if success:
             results["successes"] += 1
             results["success_episodes"].append(trial_idx)
@@ -734,6 +801,21 @@ def run_single_task(
             success=success,
             task_description=task_description,
         )
+        if protocol_identity is not None:
+            record = dict(protocol_sha256=protocol_identity["protocol_sha256"],
+                          pairing_sha256=protocol_identity["pairing_sha256"],
+                          checkpoint_sha256=protocol_identity["checkpoint_sha256"],
+                          task_id=int(cfg.EVALUATION.task_id), initial_state_id=trial_idx,
+                          success=bool(success), executed_steps=len(replay_images),
+                          policy=str(cfg.routing_eval.policy), seed=int(cfg.seed))
+            results["episodes"].append(record)
+            if record_directory is not None:
+                gate_history.save(record_directory / "gate_history")
+                atomic_json(record_directory / "episode_manifest.json", dict(**record,
+                    num_replans=len(list((record_directory/"raw_predictions").glob("replan_*.pt"))),
+                    checkpoint=str(cfg.ckpt), task_suite_name=str(cfg.EVALUATION.task_suite_name),
+                    initial_state_index=trial_idx, raw_dir=str(record_directory/"raw_predictions")))
+            atomic_json(episode_path, record)
         if visualize_future_video:
             if len(predicted_future_video_clips) == 0:
                 logging.warning(
@@ -799,6 +881,7 @@ def eval_single_process(cfg: DictConfig):
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
     _load_model_checkpoint(model, str(cfg.ckpt))
     model = model.to(model_device).eval()
+    apply_routing_policy(model, cfg)
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
@@ -825,7 +908,8 @@ def eval_single_process(cfg: DictConfig):
 
     local_log_dir = Path(cfg.EVALUATION.output_dir)
     local_log_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(config=cfg, f=str(local_log_dir / "resolved_eval_config.yaml"))
+    config_name = f"resolved_eval_config_task{cfg.EVALUATION.task_id}.yaml" if cfg.get("routing_eval") is not None else "resolved_eval_config.yaml"
+    OmegaConf.save(config=cfg, f=str(local_log_dir / config_name))
     if training_config_path is not None:
         (local_log_dir / "training_config_path.txt").write_text(
             str(training_config_path) + "\n",
@@ -842,8 +926,14 @@ def eval_single_process(cfg: DictConfig):
     task = task_suite.get_task(cfg.EVALUATION.task_id)
     initial_states = task_suite.get_task_init_states(cfg.EVALUATION.task_id)
 
-    while len(initial_states) < int(cfg.EVALUATION.num_trials):
-        initial_states.extend(initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))])
+    protocol_identity = None
+    if cfg.get("routing_eval") is not None:
+        cfg.EVALUATION.num_trials = len(initial_state_ids(cfg, len(initial_states)))
+        protocol_identity = evaluation_identity(cfg, dataset_stats_path)
+        atomic_json(local_log_dir / f"protocol_task{cfg.EVALUATION.task_id}.json", protocol_identity)
+    else:
+        while len(initial_states) < int(cfg.EVALUATION.num_trials):
+            initial_states.extend(initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))])
 
     results = {
         "task_suite": cfg.EVALUATION.task_suite_name,
@@ -871,6 +961,7 @@ def eval_single_process(cfg: DictConfig):
         input_w=input_w,
         input_h=input_h,
         model_device=model_device,
+        protocol_identity=protocol_identity,
     )
     results.update(task_results)
 

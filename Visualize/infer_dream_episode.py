@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
+from fastwam.models.wan22.routed_wam.gate_history import GateHistory
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -45,6 +46,31 @@ def _copy_rgb_dict(images: dict[str, Any]) -> dict[str, np.ndarray]:
     return copied
 
 
+def _apply_dream_inference_override(cfg: DictConfig) -> None:
+    """Apply after restoring training config so an evaluation override survives."""
+    steps = cfg.EVALUATION.get("dream_inference_steps")
+    if steps is None:
+        return
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+        raise ValueError("EVALUATION.dream_inference_steps must be a positive integer.")
+    if not cfg.model.get("generative_dream", {}).get("enabled", False):
+        raise ValueError("dream_inference_steps requires a generative RoutedWAM checkpoint.")
+    OmegaConf.update(cfg, "model.dream_scheduler.inference_steps", steps, force_add=True)
+
+
+def _dream_inference_metadata(model, cfg: DictConfig) -> dict[str, Any]:
+    generative = bool(getattr(model.dream_expert, "generative_enabled", False))
+    decoders = getattr(model.dream_expert, "decoders", {})
+    dyn = decoders["dyn"] if "dyn" in decoders else None
+    return {
+        "model_class": type(model).__name__,
+        "dream_prediction_mode": "flow_matching" if generative else "regression",
+        "dream_inference_steps": int(model.dream_inference_steps) if generative else None,
+        "action_inference_steps": int(cfg.EVALUATION.num_inference_steps),
+        "dyn_camera_layout": getattr(dyn, "camera_layout", "horizontal"),
+    }
+
+
 def _prepare_model_and_processor(cfg: DictConfig):
     from experiments.libero.eval_libero_single import (
         _apply_training_model_config,
@@ -58,6 +84,7 @@ def _prepare_model_and_processor(cfg: DictConfig):
     from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 
     training_config_path = _apply_training_model_config(cfg)
+    _apply_dream_inference_override(cfg)
     model_device = _resolve_eval_device(cfg)
     model_dtype = _mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
@@ -130,7 +157,7 @@ def run_one_episode(cfg: DictConfig) -> dict[str, Any]:
     from libero.libero import benchmark
 
     if cfg.ckpt is None:
-        raise ValueError("Pass ckpt=/path/to/dream_fastwam_checkpoint.pt.")
+        raise ValueError("Pass ckpt=/path/to/dream_fastwam_or_routed_wam_checkpoint.pt.")
     set_global_seed(int(cfg.get("seed", 42)), get_worker_init_fn=False)
     (
         model,
@@ -139,10 +166,21 @@ def run_one_episode(cfg: DictConfig) -> dict[str, Any]:
         training_config_path,
         dataset_stats_path,
     ) = _prepare_model_and_processor(cfg)
+    from fastwam.utils.routing_evaluation import apply_routing_policy, rollout_seed
+    apply_routing_policy(model, cfg)
     if not hasattr(model, "dream_expert"):
         raise TypeError(
-            "Dream episode visualization requires DreamFastWAM, but the loaded model has no dream_expert."
+            "Dream episode visualization requires DreamFastWAM or RoutedWAM with a dream_expert."
         )
+    if bool(cfg.VISUALIZATION.get("require_group_gates", False)):
+        mot = getattr(model, "mot", None)
+        router = getattr(mot, "router", None)
+        if (getattr(mot, "feature_router", None) is None
+                and not (router is not None and router.config.mode == "learned")):
+            raise ValueError(
+                "Gate visualization requires a learned group or full/static/dynamic Router checkpoint."
+            )
+    inference_metadata = _dream_inference_metadata(model, cfg)
 
     output_dir = Path(cfg.EVALUATION.output_dir)
     raw_dir = output_dir / "raw_predictions"
@@ -164,6 +202,8 @@ def run_one_episode(cfg: DictConfig) -> dict[str, Any]:
             f"initial_state_index={initial_state_index} is outside [0,{len(initial_states) - 1}]."
         )
     env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
+    if cfg.get("routing_eval") is not None:
+        env.seed(rollout_seed(cfg.seed, task_id, initial_state_index))
     obs = env.reset()
     obs = env.set_init_state(initial_states[initial_state_index])
 
@@ -185,6 +225,7 @@ def run_one_episode(cfg: DictConfig) -> dict[str, Any]:
         raise ValueError("replan_steps and action_horizon must both be positive.")
 
     pending_actions: list[list[float]] = []
+    gate_history = GateHistory()
     rollout_images = []
     record_paths = []
     replan_index = 0
@@ -211,20 +252,21 @@ def run_one_episode(cfg: DictConfig) -> dict[str, Any]:
                 device=model_device,
                 dtype=model.torch_dtype,
             )
-            with torch.no_grad():
-                prediction = model.infer_action(
-                    **_inference_kwargs(
+            inference_kwargs = _inference_kwargs(
                         cfg,
                         prompt=prompt,
                         image=image,
                         proprio=proprio,
                         action_horizon=action_horizon,
                     )
-                )
+            if cfg.get("routing_eval") is not None:
+                inference_kwargs["seed"] = rollout_seed(cfg.seed, task_id, initial_state_index, replan_index)
+            with torch.no_grad():
+                prediction = model.infer_action(**inference_kwargs)
             if "dream_predictions" not in prediction:
                 raise RuntimeError(
                     "Model inference did not return dream_predictions. "
-                    "Use a DreamFastWAM checkpoint and the updated inference implementation."
+                    "Use a DreamFastWAM or RoutedWAM checkpoint with Dream prediction support."
                 )
             executable_action = _to_executable_action(
                 prediction["action"],
@@ -232,15 +274,20 @@ def run_one_episode(cfg: DictConfig) -> dict[str, Any]:
                 binarize_gripper=bool(cfg.EVALUATION.binarize_gripper),
             )
             pending_actions = executable_action[:replan_steps].tolist()
+            gate_history.begin_decision(prediction)
+            if bool(cfg.VISUALIZATION.get("require_group_gates", False)) and "group_gates" not in prediction:
+                raise RuntimeError("Model did not return group_gates for this replan.")
 
             record = {
                 "metadata": {
+                    **inference_metadata,
                     "replan_index": replan_index,
                     "env_step": env_step,
                     "task_suite_name": suite_name,
                     "task_id": task_id,
                     "initial_state_index": initial_state_index,
                     "task_description": task_description,
+                    "noise_seed": inference_kwargs["seed"],
                 },
                 "rgb": _copy_rgb_dict(rgb_images),
                 "proprio": proprio.detach().cpu().float(),
@@ -251,18 +298,26 @@ def run_one_episode(cfg: DictConfig) -> dict[str, Any]:
                 "camera_token_split": prediction.get("camera_token_split"),
             }
             record_path = raw_dir / f"replan_{replan_index:04d}.pt"
+            if "group_gates" in prediction:
+                record["routing"] = {key: prediction[key] for key in (
+                    "group_gates", "group_mapping", "dino_activation", "tracker_activation",
+                    "sam_activation", "depth_activation",
+                    "group_gates_per_layer", "gate_kind", "gate_denoising_step", "gate_layer_reduction",
+                ) if key in prediction}
             torch.save(record, record_path)
             record_paths.append(record_path)
             replan_index += 1
             rollout_images.append(rgb_images)
 
         obs, _, success, _ = env.step(pending_actions.pop(0))
+        gate_history.append_step(env_step)
         env_step += 1
         if success:
             break
 
     if hasattr(env, "close"):
         env.close()
+    gate_history.save(output_dir / "gates")
 
     for record_path in record_paths:
         record = torch.load(record_path, map_location="cpu", weights_only=False)
@@ -281,6 +336,7 @@ def run_one_episode(cfg: DictConfig) -> dict[str, Any]:
         )
 
     manifest = {
+        **inference_metadata,
         "checkpoint": str(cfg.ckpt),
         "training_config_path": (
             None if training_config_path is None else str(training_config_path)
@@ -318,6 +374,7 @@ def run_one_episode(cfg: DictConfig) -> dict[str, Any]:
             sam_clusters=int(cfg.VISUALIZATION.sam_clusters),
             draw_contours=bool(cfg.VISUALIZATION.draw_contours),
             max_projection_samples=int(cfg.VISUALIZATION.max_projection_samples),
+            sam_render_mode=str(cfg.VISUALIZATION.get("sam_render_mode", "regions")),
         )
         manifest["render"] = render_result
         (output_dir / "episode_manifest.json").write_text(

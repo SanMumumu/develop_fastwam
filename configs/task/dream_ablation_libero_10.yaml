@@ -1,0 +1,42 @@
+# @package _global_
+defaults:
+  - dense_router_libero_10_full
+  - _self_
+
+output_dir: ./runs/dream_ablation_libero_10/all_seed42
+seed: 42
+max_steps: 4000
+batch_size: 32
+gradient_accumulation_steps: 2
+expected_global_batch_size: 256
+save_every: 1500
+log_every: 10
+eval_every: 0
+reset_router_on_weight_load: false
+resume: ./checkpoints/libero_uncond_2cam224_100m.pt
+router_learning_rate: null
+wandb:
+  enabled: true
+  project: DreamAblation
+  group: libero_10_seed42
+  mode: online
+
+# Keep the full data/model layout even when some losses and token groups are off.
+data:
+  train:
+    dream_target:
+      modalities: [dyn, depth, dino, sam]
+      future_offsets: [16, 32]
+
+model:
+  active_dream_modalities: [dyn, depth, dino, sam]
+  router:
+    routing_mode: full
+  loss:
+    lambda_video: 0.0
+    lambda_action: 1.0
+    lambda_dream: 0.1
+    lambda_dyn: 1.0
+    lambda_depth: 1.0
+    lambda_dino: 1.0
+    lambda_sam: 1.0

@@ -20,6 +20,7 @@ pin_memory: false
 # scheduler
 lr_scheduler_type: "cosine"
 learning_rate: 1.0e-4
+router_learning_rate: null  # null shares the expert LR; RoutedWan22Trainer only.
 num_epochs: 2
 max_steps: null
 log_every: 10
@@ -47,9 +48,9 @@ expected_global_batch_size: null
 
 # wandb
 wandb:
-  enabled: false
+  enabled: true
   workspace: null
-  project: dream_fastwam
+  project: RoutedWAM
   name: train
   group: null
   mode: online

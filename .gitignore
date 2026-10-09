@@ -13,6 +13,11 @@ evaluate_results/
 
 # Vendored LIBERO benchmark (should live in its own repo)
 experiments/libero/libero/
+/LIBERO/
+
+# Local third-party checkout and figure artifacts
+/third_party/vggt/
+/figures/
 
 # LIBERO generated init files
 *.pruned_init

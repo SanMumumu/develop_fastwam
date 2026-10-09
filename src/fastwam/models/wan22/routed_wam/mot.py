@@ -2,8 +2,8 @@
 
 Two things are added on top of :class:`fastwam.models.wan22.mot.MoT`:
 
-1. **Routing.**  Action query rows are materialised explicitly so a per-key gate
-   can be injected additively into the attention logits.  Every other query row
+1. **Routing.**  Action query rows are materialised explicitly. Semantic tanh
+   gates multiply Dream logits; ImaginationRouter gates add log(gate). Every other query row
    keeps the original fused SDPA path, so the cost of routing is bounded by the
    action chunk length (32 tokens), not by the mixed sequence length.
 
@@ -21,6 +21,7 @@ swapping ``model.mot`` the same way ``ActionDreamThresholdMoT`` is.
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
+from contextlib import nullcontext
 
 import torch
 
@@ -103,7 +104,54 @@ class RoutedMoT(MoT):
         return mask.expand(batch_size, num_heads, action_len, total_seq_len)
 
     # -------------------------------------------------------------- attention
-    def _routed_action_attention(
+    @staticmethod
+    def _current_video_keys(k_all, attention_mask, action_slice, video_slice):
+        """Select the current observation using the same mask Action actually reads.
+
+        DreamFastWAM builds these columns from min(tokens_per_frame, video_seq_len).
+        Check the Video rows too: slicing current keys alone would not prevent
+        indirect future leakage through bidirectional Video self-attention.
+        """
+        mask = attention_mask.to(device=k_all.device)
+        if mask.dtype != torch.bool or mask.ndim != 2:
+            raise ValueError("Current Video selection requires the 2D boolean mixed mask.")
+        action_video = mask[action_slice, video_slice]
+        visible = action_video[0]
+        if not bool(visible.any()) or not torch.equal(action_video, visible.expand_as(action_video)):
+            raise ValueError("All Action queries must see the same nonempty current Video frame.")
+        count = int(visible.sum())
+        if not torch.equal(visible, torch.arange(visible.numel(), device=visible.device) < count):
+            raise ValueError("Current Video keys must be a frame-zero prefix of the Video slice.")
+        start = int(video_slice.start or 0)
+        current_slice = slice(start, start + count)
+        other = torch.ones(mask.shape[-1], dtype=torch.bool, device=mask.device)
+        other[current_slice] = False
+        if bool(mask[current_slice, :][:, other].any()):
+            raise ValueError("Current Video must not read future Video, Dream or Action; use first_frame_causal.")
+        return k_all[:, current_slice]
+
+    @staticmethod
+    def _add_dream_log_gate(scores, allowed, gate, dream_slice):
+        """exp(S + log(g)) = g * exp(S): a pre-softmax group attention prior."""
+        allowed = allowed.clone()
+        allowed[..., dream_slice] &= (gate > 0.0)[:, None, None, :]
+        scores = scores.masked_fill(~allowed, -torch.inf)
+        # A fresh additive tensor preserves the gate gradient without modifying
+        # the masked-fill output in place. Exact zero is a hard mask; log(1)=0.
+        log_bias = scores.new_zeros((scores.shape[0], 1, 1, scores.shape[-1]))
+        log_bias[..., dream_slice] = torch.log(gate.clamp_min(_LOG_EPS))[:, None, None, :]
+        return scores + log_bias
+
+    def _routed_action_attention(self, **kwargs):
+        # Keep the learned prior and attention arithmetic in FP32 under AMP.
+        # Threshold keeps its existing arithmetic and numerical behavior.
+        learned = self.router.config.mode == "learned"
+        precision = (torch.autocast(device_type=kwargs["q_action"].device.type, enabled=False)
+                     if learned else nullcontext())
+        with precision:
+            return self._routed_action_attention_impl(**kwargs)
+
+    def _routed_action_attention_impl(
         self,
         *,
         q_action: torch.Tensor,
@@ -112,13 +160,14 @@ class RoutedMoT(MoT):
         attention_mask: torch.Tensor,
         action_slice: slice,
         dream_slice: slice,
+        video_slice: slice,
         layer_idx: int,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Explicit action-row attention with a multiplicative gate on Dream keys.
 
         The gate enters as ``+log(gate)`` on the pre-softmax logits, which scales
         the unnormalised attention weight by exactly ``gate``.  A gate of 1 adds
-        ``log(1) == 0`` and therefore reproduces the dense result bit for bit; a
+        ``log(1) == 0`` and therefore reproduces the dense distribution; a
         gate of 0 is applied as a mask instead, to avoid ``log(0)`` arithmetic.
         """
         batch_size, action_len, inner_dim = q_action.shape
@@ -162,30 +211,32 @@ class RoutedMoT(MoT):
                 )
             n_valid = valid_counts[:, 0].to(dtype=dense_probs.dtype)
 
+        k_video_current = None
+        if self.router.config.mode == "learned" and self.router.config.gate_type == "va":
+            k_video_current = self._current_video_keys(
+                k_all, attention_mask, action_slice, video_slice
+            )
         gate_info = self.router.gate_for_layer(
             layer_idx=layer_idx,
             q_action=q_action,
-            k_dream=k_all[:, dream_slice],
+            k_video_current=k_video_current,
+            k_dream=(k_all[:, dream_slice] if self.router.config.mode == "learned"
+                     and self.router.config.gate_type == "da" else None),
             dense_probs=dense_probs,
             dream_slice=dream_slice,
             n_valid=n_valid,
         )
         gate = gate_info["gate"].to(dtype=scores.dtype)
 
-        allowed = allowed.clone()
-        allowed[..., dream_slice] &= (gate > 0.0)[:, None, None, :]
-        scores = scores.masked_fill(~allowed, -torch.inf)
-        # Build the additive bias in a fresh tensor rather than writing into
-        # `scores` in place: the write carries the gate's gradient, and keeping
-        # it out of the masked-fill output avoids aliasing the autograd graph.
-        log_bias = scores.new_zeros((batch_size, 1, 1, total_seq_len))
-        log_bias[..., dream_slice] = torch.log(gate.clamp_min(_LOG_EPS))[:, None, None, :]
-        scores = scores + log_bias
+        scores = self._add_dream_log_gate(scores, allowed, gate, dream_slice)
 
         probs = torch.softmax(scores, dim=-1)
         if not bool(torch.isfinite(probs).all()):
             raise FloatingPointError("Routed action attention probabilities contain NaN/Inf.")
-        out = torch.matmul(probs.to(dtype=v.dtype), v)
+        if self.router.config.mode == "learned":
+            out = torch.matmul(probs, v.float()).to(v.dtype)
+        else:
+            out = torch.matmul(probs.to(dtype=v.dtype), v)
         out = out.transpose(1, 2).reshape(batch_size, action_len, inner_dim)
         if self.capture_action_attention:
             with torch.no_grad():
@@ -204,6 +255,30 @@ class RoutedMoT(MoT):
                     }
                 )
         return out, gate_info
+
+    @torch.no_grad()
+    def _compute_action_attention_probs(
+        self, q_cat, k_cat, attention_mask, action_slice, *, dream_slice=None, gate=None,
+    ):
+        """Report the distribution used by attention, including its actual gate."""
+        if gate is None:
+            return super()._compute_action_attention_probs(
+                q_cat, k_cat, attention_mask, action_slice)
+        if q_cat.shape[0] != 1:
+            raise ValueError("Action attention debug currently supports batch size 1 only.")
+        learned = self.router.config.mode == "learned"
+        precision = (torch.autocast(device_type=q_cat.device.type, enabled=False)
+                     if learned else nullcontext())
+        with precision:
+            q = q_cat[:, action_slice].reshape(1, -1, self.num_heads, self.attn_head_dim).transpose(1, 2)
+            k = k_cat.reshape(1, -1, self.num_heads, self.attn_head_dim).transpose(1, 2)
+            scores = (q.float() @ k.float().transpose(-2, -1)) * (self.attn_head_dim ** -0.5)
+            allowed = self._broadcast_action_mask(
+                attention_mask, action_slice, batch_size=1, num_heads=self.num_heads,
+                total_seq_len=k_cat.shape[1], device=q.device,
+            )
+            scores = self._add_dream_log_gate(scores, allowed, gate.to(scores.dtype), dream_slice)
+            return scores.softmax(dim=-1).cpu()
 
     # ---------------------------------------------------------------- forward
     def forward(
@@ -237,10 +312,7 @@ class RoutedMoT(MoT):
         if attention_mask.ndim != 2:
             raise ValueError("RoutedMoT.forward expects a 2D mixed attention mask.")
 
-        if self.router is not None:
-            self.router.reset_statistics()
         self.captured_kv = []
-        gates: list[torch.Tensor] = []
         tokens_all = dict(embeds_all)
         attention_layers_set = None if attention_layers is None else {int(x) for x in attention_layers}
         action_attention_records: list[dict[str, Any]] = []
@@ -283,6 +355,7 @@ class RoutedMoT(MoT):
             slices = self._expert_slices(self.expert_order, seq_lens)
             action_slice = slices["action"]
             dream_slice = slices["dream"]
+            video_slice = slices["video"]
             total_seq = int(q_cat.shape[1])
             if attention_mask.shape != (total_seq, total_seq):
                 raise ValueError("Attention mask does not match the dynamic expert lengths.")
@@ -304,15 +377,17 @@ class RoutedMoT(MoT):
                     ctx_mask=attention_mask[:non_action_end, :],
                 )
 
-                def _action_fn(q_action, k_all, v_all):
+                def _action_fn(q_action, k_all, v_all, _layer=layer_idx,
+                               _action=action_slice, _dream=dream_slice, _video=video_slice):
                     return self._routed_action_attention(
                         q_action=q_action,
                         k_all=k_all,
                         v_all=v_all,
                         attention_mask=attention_mask,
-                        action_slice=action_slice,
-                        dream_slice=dream_slice,
-                        layer_idx=layer_idx,
+                        action_slice=_action,
+                        dream_slice=_dream,
+                        video_slice=_video,
+                        layer_idx=_layer,
                     )
 
                 if self.mot_checkpoint_mixed_attn and self.training:
@@ -325,14 +400,7 @@ class RoutedMoT(MoT):
                     )
                 else:
                     action_out, gate_info = _action_fn(q_cat[:, action_slice], k_cat, v_cat)
-                gates.append(gate_info["gate"])
-                if self.router is not None:
-                    self.router.record(
-                        layer_idx=layer_idx,
-                        gate=gate_info["gate"],
-                        keep=gate_info["keep"],
-                        score=gate_info["score"],
-                    )
+                self._record_gate_info(layer_idx, gate_info)
                 mixed = torch.cat([non_action_out, action_out], dim=1)
             else:
                 mixed = self._mixed_attention(
@@ -350,6 +418,8 @@ class RoutedMoT(MoT):
                             k_cat=k_cat,
                             attention_mask=attention_mask,
                             action_slice=action_slice,
+                            dream_slice=dream_slice,
+                            gate=gate_info["gate"] if self.routing_enabled else None,
                         ),
                         "slices": {n: [s.start, s.stop] for n, s in slices.items()},
                     }
@@ -369,7 +439,6 @@ class RoutedMoT(MoT):
                     context_payload=context_all.get(name),
                 )
 
-        self.last_gates = gates
         if return_action_attention or return_router_statistics:
             result: dict[str, Any] = {"tokens": tokens_all}
             if return_action_attention:
@@ -390,7 +459,42 @@ class RoutedMoT(MoT):
         action_slice: slice,
         context_slices: dict[str, slice],
         layer_idx: int,
+        dream_token_gates: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        feature_router = getattr(self, "feature_router", None)
+        if feature_router is not None and (not feature_router.full or dream_token_gates is not None):
+            if dream_token_gates is None:
+                raise ValueError("Semantic QK attention requires cached Dream token gates.")
+            dream_slice = context_slices["dream"]
+            if dream_token_gates.shape != (q_action.shape[0], dream_slice.stop - dream_slice.start):
+                raise ValueError("Dream QK gates must be [batch, dream_tokens].")
+            mask = attention_mask[action_slice, :].to(device=q_action.device)
+            if mask.dtype != torch.bool:
+                raise TypeError("Semantic QK routing requires a boolean attention mask.")
+
+            def attend(q, k, v, gates):
+                with torch.autocast(device_type=q.device.type, enabled=False):
+                    b = q.shape[0]
+                    def heads(x):
+                        return x.float().reshape(b, -1, self.num_heads, self.attn_head_dim).transpose(1, 2)
+                    scores = (heads(q) @ heads(k).transpose(-2, -1)) * (self.attn_head_dim ** -0.5)
+                    scores = torch.cat([
+                        scores[..., :dream_slice.start],
+                        scores[..., dream_slice] * gates.float()[:, None, None, :],
+                        scores[..., dream_slice.stop:],
+                    ], dim=-1)
+                    # Apply masks AFTER scaling: zero gates must never create 0 * -inf.
+                    scores = scores.masked_fill(~mask, -torch.inf)
+                    # Match SDPA's zero output for a fully masked query row.
+                    scores = scores.masked_fill(~mask.any(dim=-1, keepdim=True), 0)
+                    probabilities = scores.softmax(dim=-1).masked_fill(~mask, 0)
+                    output = probabilities @ heads(v)
+                    return output.transpose(1, 2).reshape(b, q.shape[1], -1).to(q.dtype)
+
+            if self.mot_checkpoint_mixed_attn and self.training:
+                return torch.utils.checkpoint.checkpoint(
+                    attend, q_action, k_all, v_all, dream_token_gates, use_reentrant=False)
+            return attend(q_action, k_all, v_all, dream_token_gates)
         if not self.routing_enabled:
             return super()._action_attention_with_context_cache(
                 q_action=q_action,
@@ -423,6 +527,15 @@ class RoutedMoT(MoT):
                 keep=gate_info["keep"],
                 score=gate_info["score"],
             )
+
+        if self.mot_checkpoint_mixed_attn and self.training:
+            out, gate_info = torch.utils.checkpoint.checkpoint(
+                attend, q_action, k_all, v_all, use_reentrant=False)
+        else:
+            out, gate_info = attend(q_action, k_all, v_all)
+        # Stage-1 training uses this cached path rather than forward(). Keep
+        # gates from exactly this Action forward; logging stays outside recompute.
+        self._record_gate_info(layer_idx, gate_info)
         return out
 
     def forward_action_with_context_cache(self, *args, **kwargs) -> torch.Tensor:

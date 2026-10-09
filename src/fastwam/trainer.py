@@ -288,6 +288,12 @@ class Wan22Trainer:
             milestones=[warmup_steps],
         )
     
+    def _optimizer_learning_rate_metrics(self):
+        return {
+            f"lr_{group['name']}": float(group["lr"])
+            for group in self.optimizer.param_groups if "name" in group
+        }
+
     def _estimate_eta(self):
         elapsed = max(time.perf_counter() - self.run_start_time, 1e-6)
         done_steps = max(self.global_step - self.run_start_step, 1)
@@ -871,6 +877,9 @@ class Wan22Trainer:
                     if profiling:
                         stage_start = time.perf_counter()
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    gradient_metrics = getattr(unwrapped_model, "routing_gradient_metrics", None)
+                    if gradient_metrics is not None:
+                        loss_dict.update(gradient_metrics())
                     self.optimizer.step()
                     if not self.accelerator.optimizer_step_was_skipped:
                         self.scheduler.step()
@@ -928,6 +937,7 @@ class Wan22Trainer:
                         profile_reported = True
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
+                    global_loss_metrics.update(self._optimizer_learning_rate_metrics())
 
                     if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
                         eta_str, steps_per_sec = self._estimate_eta()
@@ -938,7 +948,10 @@ class Wan22Trainer:
                             global_loss,
                         )
                         if global_loss_metrics:
-                            detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
+                            detail_str = " ".join([
+                                f"{k}={v:.3e}" if k.startswith("lr_") else f"{k}={v:.4f}"
+                                for k, v in sorted(global_loss_metrics.items())
+                            ])
                             description += detail_str + " "
                         description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
                             current_lr,
@@ -958,6 +971,21 @@ class Wan22Trainer:
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
                         self._wandb_log(wandb_payload)
+
+                    if self.cfg.get("experiment") is not None and self.accelerator.is_main_process:
+                        record = {"step": self.global_step, "loss": global_loss, "lr": current_lr,
+                                  "grad_norm": global_grad_norm, **global_loss_metrics,
+                                  "elapsed_seconds": time.perf_counter() - self.run_start_time,
+                                  "peak_memory_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0}
+                        if not all(np.isfinite(v) for v in record.values()):
+                            raise FloatingPointError("Non-finite routing experiment training metric.")
+                        with open(Path(self.output_dir) / "metrics.jsonl", "a", encoding="utf-8") as handle:
+                            handle.write(json.dumps(record, allow_nan=False) + "\n")
+
+                    stop_after = self.cfg.get("experiment", {}).get("stop_after_steps", 0)
+                    if stop_after and self.global_step >= int(stop_after):
+                        self.save_checkpoint()
+                        return
 
                     if (
                         self.eval_every > 0

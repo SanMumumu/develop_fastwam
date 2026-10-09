@@ -27,6 +27,9 @@ EVALUATION:
   binarize_gripper: true
   action_horizon: null
   num_inference_steps: ${eval_num_inference_steps}
+  # RoutedWAM only; null preserves the checkpoint's Dream schedule.
+  # Applied AFTER training config restoration, independently of Action steps.
+  dream_inference_steps: null
   sigma_shift: null
   text_cfg_scale: 1.0
   negative_prompt: ""
@@ -45,6 +48,8 @@ VISUALIZATION:
   panel_size: 224
   overlay_alpha: 0.5
   sam_clusters: 8
+  # regions = feature clustering (not decoded segmentation masks); pca = features
+  sam_render_mode: regions
   draw_contours: true
   max_projection_samples: 2048
 

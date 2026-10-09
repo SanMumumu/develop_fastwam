@@ -21,7 +21,7 @@ save_every: 2000
 eval_every: 0
 gradient_accumulation_steps: 1
 weight_decay: 1e-2
-resume: null
+resume: ./checkpoints/libero_uncond_2cam224_100m.pt
 freeze_video_expert: true
 
 model:

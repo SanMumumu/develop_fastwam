@@ -1,16 +1,15 @@
 # @package _global_
 #
-# Legacy generative experiment: interface distillation on LIBERO-goal.
-# Resume from a generative stage-1 checkpoint and train the one-step student Dream
-# pass to reproduce the per-layer Dream K/V of an 8-step EMA teacher. Inference
-# then runs `dream_scheduler.inference_steps: 1`.
+# Legacy generative experiment: interface distillation on all four LIBERO suites.
+# Same recipe as routed_wam_libero_goal_distill, with four-suite data.
+# Set resume to a generative stage-1 checkpoint before launching.
 
 defaults:
-  - override /data: libero_goal_2cam
+  - override /data: libero_dream_4suite_2cam
   - override /model: routed_wam
   - _self_
 
-output_dir: ./runs/routed_wam_libero_goal_distill/${now:%Y-%m-%d}_${now:%H-%M-%S}
+output_dir: ./runs/routed_wam_libero_4suite_distill/${now:%Y-%m-%d}_${now:%H-%M-%S}
 
 batch_size: 16
 num_workers: 4
@@ -23,7 +22,6 @@ save_every: 2000
 eval_every: 0
 gradient_accumulation_steps: 1
 weight_decay: 1e-2
-# Point this at the stage-1 checkpoint before submitting.
 resume: null
 freeze_video_expert: true
 
